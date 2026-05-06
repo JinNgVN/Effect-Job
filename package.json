@@ -1,0 +1,24 @@
+{
+    "name": "effect-job",
+    "module": "src/index.ts",
+    "type": "module",
+    "exports": {
+        ".": "./src/index.ts"
+    },
+    "scripts": {
+        "dev": "bun index.ts",
+        "typecheck": "tsc --noEmit",
+        "test": "vitest run",
+        "dev:example": "bun examples/basic/index.ts"
+    },
+    "devDependencies": {
+        "@types/bun": "latest",
+        "@types/node": "^25.6.0",
+        "typescript": "^6.0.3",
+        "vitest": "^4.1.5"
+    },
+    "dependencies": {
+        "@effect/sql-pg": "^4.0.0-beta.60",
+        "effect": "^4.0.0-beta.60"
+    }
+}
