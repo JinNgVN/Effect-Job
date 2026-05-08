@@ -9,6 +9,7 @@
         "effect": "^4.0.0-beta.60",
       },
       "devDependencies": {
+        "@effect/language-service": "^0.85.1",
         "@types/bun": "latest",
         "@types/node": "^25.6.0",
         "typescript": "^6.0.3",
@@ -17,6 +18,8 @@
     },
   },
   "packages": {
+    "@effect/language-service": ["@effect/language-service@0.85.1", "", { "bin": { "effect-language-service": "cli.js" } }, "sha512-EXnJjIy6zQ3nUO/MZ+ynWUb8B895KZPotd1++oTs9JjDkplwM7cb6zo8Zq2zU6piwq+KflO7amXbEfj1UMpHkw=="],
+
     "@effect/sql-pg": ["@effect/sql-pg@4.0.0-beta.60", "", { "dependencies": { "pg": "^8.20.0", "pg-connection-string": "2.12.0", "pg-cursor": "^2.19.0", "pg-pool": "^3.13.0", "pg-types": "^4.1.0" }, "peerDependencies": { "effect": "^4.0.0-beta.60" } }, "sha512-YvjVqPj4xUxoY/OD8sxrHVRMYWRK98MpS0feTgNJAEq4lMvR85Z2gCCL25YpfKWNBVRKVvXnMGdzedHDUcDUvg=="],
 
     "@emnapi/core": ["@emnapi/core@1.10.0", "", { "dependencies": { "@emnapi/wasi-threads": "1.2.1", "tslib": "^2.4.0" } }, "sha512-yq6OkJ4p82CAfPl0u9mQebQHKPJkY7WrIuk205cTYnYe+k2Z8YBh11FrbRG/H6ihirqcacOgl2BIO8oyMQLeXw=="],

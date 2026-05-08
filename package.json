@@ -6,12 +6,13 @@
         ".": "./src/index.ts"
     },
     "scripts": {
-        "dev": "bun index.ts",
+        "dev": "bun src/index.ts",
         "typecheck": "tsc --noEmit",
         "test": "vitest run",
         "dev:example": "bun examples/basic/index.ts"
     },
     "devDependencies": {
+        "@effect/language-service": "^0.85.1",
         "@types/bun": "latest",
         "@types/node": "^25.6.0",
         "typescript": "^6.0.3",
