@@ -6,10 +6,10 @@
         ".": "./src/index.ts"
     },
     "scripts": {
-        "dev": "bun src/index.ts",
         "typecheck": "tsc --noEmit",
         "test": "vitest run",
-        "dev:example": "bun examples/basic/index.ts"
+        "dev:server": "bun examples/dev/server.ts",
+        "dev:send": "bun examples/dev/send.ts"
     },
     "devDependencies": {
         "@effect/language-service": "^0.85.1",

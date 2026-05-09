@@ -1,9 +1,13 @@
+// Handler registry: maps job names to the Effect handlers workers can execute.
+
 import { Context, Data, Effect, Layer, Option } from "effect";
 
-import type { JobDefinition, JobName } from "./job";
+import type { JobContext, JobDefinition } from "./job";
+import type { JobName } from "./model";
 
-type JobRun = (
+export type JobRun = (
     payload: any,
+    context: JobContext,
 ) => Effect.Effect<any, any, any>;
 
 export interface RegisteredJob {

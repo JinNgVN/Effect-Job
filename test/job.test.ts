@@ -1,7 +1,6 @@
 import { Effect, Layer, Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import { Job } from "../src/jobImpl"
-import { JobRegistry, JobRegistryMemory } from "../src/registry"
+import { Job, JobRegistry, JobRegistryMemory } from "../src"
 
 describe("Job.make", () => {
   it("creates a job definition with defaults", () => {
@@ -14,8 +13,7 @@ describe("Job.make", () => {
 
     expect(job.name).toBe("demo.hello")
     expect(job.queue).toBe("default")
-    expect(job.attempts).toBe(3)
-    expect(job.successSchema).toBe(Schema.Void)
+    expect(job.attempts).toBe(20)
     expect(job.errorSchema).toBe(Schema.Never)
     expect(typeof job.toLayer).toBe("function")
   })
@@ -25,9 +23,6 @@ describe("Job.make", () => {
       name: "demo.hello",
       payload: Schema.Struct({
         message: Schema.String
-      }),
-      success: Schema.Struct({
-        ok: Schema.Boolean
       })
     })
 

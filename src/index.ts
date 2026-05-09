@@ -1,104 +1,132 @@
-import { Effect, Layer, Schema } from "effect";
+// Public package entrypoint.
 
-import { JobEngine, JobEngineMemory } from "./engine";
-import { Job } from "./jobImpl";
-import { JobRegistry, JobRegistryMemory } from "./registry";
-import { Worker } from "./worker";
+import { Duration, Effect, Schema } from "effect";
 
+export * from "./databases";
+export * from "./effectJob";
 export * from "./engine";
-export * from "./enqueue";
 export * from "./job";
-export * from "./jobImpl";
+export * from "./model";
+export * from "./notifier";
+export * from "./plugin";
+export * from "./plugins";
 export * from "./registry";
 export * from "./worker";
 
-const SendEmail = Job.make({
-    name: "email.send",
-    queue: "mailers",
-    payload: Schema.Struct({
-        to: Schema.String,
-        subject: Schema.String,
-        body: Schema.String,
-    }),
-    success: Schema.Struct({
-        sentAt: Schema.Date,
-    }),
-    idempotencyKey: (payload) => `${payload.to}:${payload.subject}`,
-});
+import { effectJob } from "./effectJob";
+import { Job } from "./job";
+import { memory } from "./databases";
+import { pruner, rescuer } from "./plugins";
 
-const SendEmailLive = SendEmail.toLayer((payload) =>
-    Effect.gen(function* () {
-        yield* Effect.logInfo(`Sending email to ${payload.to}`);
+const shouldRunDemo =
+    typeof Bun !== "undefined" && import.meta.path === Bun.main;
 
-        return {
-            sentAt: new Date(),
-        };
-    }),
-);
-
-const GenerateInvoice = Job.make({
-    name: "invoice.generate",
-    queue: "billing",
-    payload: Schema.Struct({
-        customerId: Schema.String,
-        month: Schema.String,
-    }),
-    success: Schema.Struct({
-        invoiceId: Schema.String,
-    }),
-    idempotencyKey: (payload) => `${payload.customerId}:${payload.month}`,
-});
-
-const GenerateInvoiceLive = GenerateInvoice.toLayer((payload) =>
-    Effect.gen(function* () {
-        yield* Effect.logInfo(
-            `Generating ${payload.month} invoice for ${payload.customerId}`,
-        );
-
-        return {
-            invoiceId: "invoice_123",
-        };
-    }),
-);
-
-const JobsLive = Layer.mergeAll(SendEmailLive, GenerateInvoiceLive).pipe(
-    Layer.provide(JobRegistryMemory),
-);
-
-const program = Effect.gen(function* () {
-    const email = yield* Job.enqueue(SendEmail, {
-        to: "ada@example.com",
-        subject: "Welcome",
-        body: "Thanks for signing up.",
+if (shouldRunDemo) {
+    const CompleteJob = Job.make({
+        name: "demo.complete",
+        queue: "demo",
+        payload: Schema.Struct({
+            message: Schema.String,
+        }),
     });
 
-    const invoice = yield* Job.enqueue(GenerateInvoice, {
-        customerId: "customer_123",
-        month: "2026-05",
+    const CancelJob = Job.make({
+        name: "demo.cancel",
+        queue: "demo",
+        payload: Schema.Struct({
+            reason: Schema.String,
+        }),
+        error: Schema.Unknown,
     });
 
-    const registry = yield* JobRegistry;
-    const registeredJobs = yield* registry.list;
+    const SnoozeJob = Job.make({
+        name: "demo.snooze",
+        queue: "demo",
+        payload: Schema.Struct({
+            seconds: Schema.Number,
+        }),
+        error: Schema.Unknown,
+    });
 
-    const engine = yield* JobEngine;
-    const queued = yield* engine.list;
+    const TimeoutJob = Job.make({
+        name: "demo.timeout",
+        queue: "demo",
+        payload: Schema.Struct({
+            message: Schema.String,
+        }),
+        attempts: 1,
+        timeout: "10 millis",
+    });
 
-    yield* Worker.runOnce({ queue: "mailers" });
-    yield* Worker.runOnce({ queue: "billing" });
+    const FailJob = Job.make({
+        name: "demo.fail",
+        queue: "demo",
+        payload: Schema.Struct({
+            message: Schema.String,
+        }),
+        error: Schema.String,
+        attempts: 2,
+        backoff: ({ attempt }) => Duration.millis(attempt * 25),
+    });
 
-    const completed = yield* engine.list;
+    const jobs = effectJob({
+        database: memory(),
+        handlers: [
+            CompleteJob.toLayer((payload, context) =>
+                Effect.logInfo(
+                    `${context.name} attempt ${context.attempt}: ${payload.message}`,
+                ),
+            ),
+            CancelJob.toLayer((payload) => Job.cancel(payload.reason)),
+            SnoozeJob.toLayer((payload) =>
+                Job.snooze(`${payload.seconds} seconds`),
+            ),
+            TimeoutJob.toLayer(() => Effect.sleep("1 second")),
+            FailJob.toLayer((payload) =>
+                Effect.fail(`failed: ${payload.message}`),
+            ),
+        ],
+        queues: {
+            demo: { concurrency: 2, pollInterval: "10 millis" },
+        },
+        plugins: [
+            pruner({
+                every: "1 hour",
+                olderThan: "7 days",
+            }),
+            rescuer(),
+        ],
+    });
 
-    yield* Effect.logInfo(`Queued ${email.name} as ${email.id}`);
-    yield* Effect.logInfo(`Queued ${invoice.name} as ${invoice.id}`);
-    yield* Effect.logInfo(`Registered handlers: ${registeredJobs.length}`);
-    yield* Effect.logInfo(`Stored jobs before worker: ${queued.length}`);
-    yield* Effect.logInfo(
-        `Completed jobs: ${completed.filter((job) => job.status === "completed").length}`,
+    await CompleteJob.new({ message: "hello" }).pipe(jobs.insert);
+    await CancelJob.new({ reason: "not needed anymore" }).pipe(jobs.insert);
+    await SnoozeJob.new({ seconds: 60 }).pipe(jobs.insert);
+    await TimeoutJob.new({ message: "too slow" }).pipe(jobs.insert);
+    await FailJob.new({ message: "try again later" }).pipe(jobs.insert);
+
+    await jobs.runPromise(
+        jobs.worker().pipe(Effect.timeoutOption("150 millis")),
     );
-});
 
-const AppLive = Layer.mergeAll(JobsLive, JobEngineMemory);
+    console.table(await jobs.queues());
 
-const runnable = program.pipe(Effect.provide(AppLive));
+    const records = await jobs.list();
 
-Effect.runSync(runnable);
+    console.table(
+        records.map((record) => ({
+            name: record.name,
+            status: record.status,
+            attempt: record.attempt,
+            maxAttempts: record.maxAttempts,
+            runAt: record.runAt.toISOString(),
+            completedAt: record.completedAt?.toISOString() ?? null,
+            cancelledAt: record.cancelledAt?.toISOString() ?? null,
+            discardedAt: record.discardedAt?.toISOString() ?? null,
+            errors: record.errors
+                .map((error) => `${error.kind}: ${error.message}`)
+                .join("; "),
+        })),
+    );
+
+    await jobs.dispose();
+}
