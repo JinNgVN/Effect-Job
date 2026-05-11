@@ -1,12 +1,11 @@
-import {
-    effectJob,
-    memory,
-} from "../../src";
-import { EchoJob, JobsLive } from "./jobs";
+import { Effect } from "effect";
 
-const jobs = effectJob({
-    database: memory(),
-    handlers: [JobsLive],
+import { Job, JobSystem } from "../../src";
+import { Catalog, EchoJob } from "./jobs";
+
+const jobs = JobSystem.memory({
+    catalog: Catalog,
+    jobs: [EchoJob],
     queues: {
         dev: { concurrency: 1, pollInterval: "250 millis" },
     },
@@ -38,14 +37,14 @@ const insertEcho = async (request: Request) => {
         );
     }
 
-    const handle = await EchoJob.new({ message }).pipe(jobs.insert);
+    const handle = await jobs.runPromise(EchoJob.enqueue({ message }));
 
     return json({ job: handle });
 };
 
-const listJobs = () => jobs.list();
+const listJobs = () => jobs.runPromise(Job.list());
 
-void jobs.runWorker();
+void jobs.runPromise(jobs.worker());
 
 const server = Bun.serve({
     port: 3000,
@@ -67,11 +66,7 @@ const server = Bun.serve({
         return json(
             {
                 error: "Not found",
-                routes: [
-                    "GET /health",
-                    "GET /jobs",
-                    "POST /jobs/echo",
-                ],
+                routes: ["GET /health", "GET /jobs", "POST /jobs/echo"],
             },
             { status: 404 },
         );

@@ -1,38 +1,41 @@
 import { Duration, Effect, Fiber, Option, Schema } from "effect";
 import { describe, expect, it } from "vitest";
 
-import { effectJob, Job, memory, pruner, rescuer } from "../src";
+import { Job, JobCatalog, JobSystem, Queue, pruner, rescuer } from "../src";
 
-describe("effectJob", () => {
-    it("wires engine, handlers, and workers from one config object", async () => {
-        const job = Job.make({
+describe("JobSystem", () => {
+    it("wires runtime, inline handlers, and workers from one config object", async () => {
+        const Catalog = JobCatalog.define({
+            queues: {
+                demo: Queue.define(),
+            },
+        });
+        const ConfiguredJob = Catalog.job({
             name: "demo.configured",
             queue: "demo",
             payload: Schema.Struct({
                 message: Schema.String,
             }),
+            run: ({ payload }) =>
+                Effect.logInfo(`configured handler: ${payload.message}`),
         });
-        const app = effectJob({
-            database: memory(),
-            handlers: [
-                job.toLayer((payload) =>
-                    Effect.logInfo(`configured handler: ${payload.message}`),
-                ),
-            ],
+        const Jobs = JobSystem.memory({
+            catalog: Catalog,
+            jobs: [ConfiguredJob],
             queues: {
                 demo: { concurrency: 1, pollInterval: "10 millis" },
             },
         });
 
-        const handle = await job.new({ message: "hello" }).pipe(app.insert);
-
-        await app.runPromise(
-            app.worker().pipe(Effect.timeoutOption("50 millis")),
+        const record = await Jobs.runPromise(
+            Effect.gen(function* () {
+                const handle = yield* ConfiguredJob.enqueue({ message: "hello" });
+                yield* Jobs.worker().pipe(Effect.timeoutOption("50 millis"));
+                return yield* Job.find(handle.id);
+            }),
         );
 
-        const record = await app.find(handle.id);
-
-        await app.dispose();
+        await Jobs.dispose();
 
         expect(Option.isSome(record)).toBe(true);
 
@@ -42,22 +45,51 @@ describe("effectJob", () => {
         }
     });
 
+    it("supports inline run handlers as beginner sugar", async () => {
+        const Catalog = JobCatalog.define();
+        let handled = false;
+        const InlineJob = Catalog.job({
+            name: "demo.inline",
+            payload: Schema.Struct({ message: Schema.String }),
+            run: ({ payload }) =>
+                Effect.sync(() => {
+                    handled = payload.message === "hello";
+                }),
+        });
+        const Jobs = JobSystem.memory({ catalog: Catalog, jobs: [InlineJob] });
+
+        await Jobs.runPromise(
+            Effect.gen(function* () {
+                yield* InlineJob.enqueue({ message: "hello" });
+                yield* Jobs.worker({ pollInterval: "10 millis" }).pipe(
+                    Effect.timeoutOption("50 millis"),
+                );
+            }),
+        );
+
+        expect(handled).toBe(true);
+    });
+
     it("runs plugin lifecycle hooks", async () => {
         const events: Array<string> = [];
         const push = (event: string) =>
             Effect.sync(() => {
                 events.push(event);
             });
-        const job = Job.make({
+        const Catalog = JobCatalog.define({
+            queues: {
+                demo: Queue.define(),
+            },
+        });
+        const PluginJob = Catalog.job({
             name: "demo.plugin",
             queue: "demo",
-            payload: Schema.Struct({
-                message: Schema.String,
-            }),
+            payload: Schema.Struct({ message: Schema.String }),
+            run: () => Effect.void,
         });
-        const app = effectJob({
-            database: memory(),
-            handlers: [job.toLayer(() => Effect.void)],
+        const Jobs = JobSystem.memory({
+            catalog: Catalog,
+            jobs: [PluginJob],
             queues: {
                 demo: { concurrency: 1, pollInterval: "10 millis" },
             },
@@ -75,11 +107,12 @@ describe("effectJob", () => {
             ],
         });
 
-        await job.new({ message: "hello" }).pipe(app.insert);
-        await app.runPromise(
-            app.worker().pipe(Effect.timeoutOption("50 millis")),
+        await Jobs.runPromise(
+            Effect.gen(function* () {
+                yield* PluginJob.enqueue({ message: "hello" });
+                yield* Jobs.worker().pipe(Effect.timeoutOption("50 millis"));
+            }),
         );
-        await app.dispose();
 
         expect(events).toEqual([
             "enqueued:demo.plugin:available",
@@ -90,32 +123,34 @@ describe("effectJob", () => {
     });
 
     it("wakes workers when a job is inserted", async () => {
-        const job = Job.make({
+        const Catalog = JobCatalog.define({
+            queues: {
+                demo: Queue.define(),
+            },
+        });
+        const NotifyJob = Catalog.job({
             name: "demo.notifier",
             queue: "demo",
-            payload: Schema.Struct({
-                message: Schema.String,
-            }),
+            payload: Schema.Struct({ message: Schema.String }),
+            run: () => Effect.void,
         });
-        const app = effectJob({
-            database: memory(),
-            handlers: [job.toLayer(() => Effect.void)],
+        const Jobs = JobSystem.memory({
+            catalog: Catalog,
+            jobs: [NotifyJob],
             queues: {
                 demo: { concurrency: 1, pollInterval: "1 hour" },
             },
         });
 
-        const record = await app.runPromise(
+        const record = await Jobs.runPromise(
             Effect.gen(function* () {
-                const worker = yield* app.worker().pipe(
+                const worker = yield* Jobs.worker().pipe(
                     Effect.forkChild({ startImmediately: true }),
                 );
 
                 yield* Effect.sleep("10 millis");
 
-                const handle = yield* job
-                    .new({ message: "hello" })
-                    .pipe(Job.insert);
+                const handle = yield* NotifyJob.enqueue({ message: "hello" });
 
                 yield* Effect.sleep("30 millis");
                 yield* Fiber.interrupt(worker);
@@ -124,8 +159,6 @@ describe("effectJob", () => {
             }),
         );
 
-        await app.dispose();
-
         expect(Option.isSome(record)).toBe(true);
 
         if (Option.isSome(record)) {
@@ -133,115 +166,95 @@ describe("effectJob", () => {
         }
     });
 
-    it("can run the bundled pruner in the worker scope", async () => {
-        const job = Job.make({
-            name: "demo.prune",
-            queue: "demo",
-            payload: Schema.Struct({
-                message: Schema.String,
-            }),
-        });
-        const app = effectJob({
-            database: memory(),
-            handlers: [job.toLayer(() => Effect.void)],
+    it("reports catalog queues and configured worker queues", async () => {
+        const Catalog = JobCatalog.define({
             queues: {
-                demo: { concurrency: 1, pollInterval: "10 millis" },
+                mailers: Queue.define(),
+                billing: Queue.define(),
             },
-            plugins: [
-                pruner({
-                    every: "10 millis",
-                    olderThan: Duration.millis(0),
-                }),
-            ],
         });
-
-        const handle = await job.new({ message: "hello" }).pipe(app.insert);
-
-        await app.runPromise(
-            app.worker().pipe(Effect.timeoutOption("80 millis")),
-        );
-
-        const record = await app.find(handle.id);
-
-        await app.dispose();
-
-        expect(Option.isNone(record)).toBe(true);
-    });
-
-    it("can run the bundled rescuer in the worker scope", async () => {
-        const job = Job.make({
-            name: "demo.rescuer",
-            queue: "demo",
-            payload: Schema.Struct({
-                message: Schema.String,
-            }),
-        });
-        const app = effectJob({
-            database: memory(),
-            handlers: [job.toLayer(() => Effect.never)],
-            queues: {
-                demo: { concurrency: 1, pollInterval: "10 millis" },
-            },
-            shutdownGracePeriod: Duration.millis(0),
-            plugins: [
-                rescuer({
-                    every: "10 millis",
-                    rescueAfter: Duration.millis(0),
-                }),
-            ],
-        });
-
-        const handle = await job.new({ message: "hello" }).pipe(app.insert);
-
-        await app.runPromise(
-            app.worker().pipe(Effect.timeoutOption("80 millis")),
-        );
-
-        const record = await app.find(handle.id);
-
-        await app.dispose();
-
-        expect(Option.isSome(record)).toBe(true);
-
-        if (Option.isSome(record)) {
-            expect(record.value.status).toBe("available");
-            expect(record.value.attempt).toBe(1);
-        }
-    });
-
-    it("reports declared and configured worker queues without scanning jobs", async () => {
-        const mailJob = Job.make({
-            name: "demo.mail",
-            queue: "mailers",
-            payload: Schema.Struct({
-                message: Schema.String,
-            }),
-        });
-        const billingJob = Job.make({
-            name: "demo.billing",
-            queue: "billing",
-            payload: Schema.Struct({
-                message: Schema.String,
-            }),
-        });
-        const app = effectJob({
-            database: memory(),
-            handlers: [
-                mailJob.toLayer(() => Effect.void),
-                billingJob.toLayer(() => Effect.void),
-            ],
+        const Jobs = JobSystem.memory({
+            catalog: Catalog,
             queues: {
                 mailers: { concurrency: 2 },
             },
         });
 
-        const queues = await app.queues();
-
-        await app.dispose();
+        const queues = await Jobs.runPromise(Jobs.queues.info);
 
         expect(queues).toEqual({
-            declared: ["billing", "mailers"],
+            declared: ["billing", "default", "mailers"],
             workers: ["mailers"],
         });
+    });
+
+    it("exposes advanced surfaces as explicit shells", async () => {
+        const Catalog = JobCatalog.define();
+        const Jobs = JobSystem.memory({ catalog: Catalog });
+
+        expect(Jobs.middleware.logging()).toEqual({ name: "logging" });
+        expect(Jobs.extension({ name: "tenant-context" })).toEqual({
+            name: "tenant-context",
+        });
+
+        await expect(Jobs.runPromise(Jobs.queues.pause("default"))).rejects.toMatchObject({
+            _tag: "JobFeatureNotImplementedError",
+            feature: "queues.pause",
+        });
+        await expect(Jobs.runPromise(Jobs.schedules.list)).rejects.toMatchObject({
+            _tag: "JobFeatureNotImplementedError",
+            feature: "schedules.list",
+        });
+    });
+
+    it("can run bundled maintenance plugins", async () => {
+        const Catalog = JobCatalog.define({
+            queues: {
+                demo: Queue.define(),
+            },
+        });
+        const PruneJob = Catalog.job({
+            name: "demo.prune",
+            queue: "demo",
+            payload: Schema.Struct({ message: Schema.String }),
+            run: () => Effect.void,
+        });
+        const RescueJob = Catalog.job({
+            name: "demo.rescue",
+            queue: "demo",
+            payload: Schema.Struct({ message: Schema.String }),
+            run: () => Effect.never,
+        });
+        const Jobs = JobSystem.memory({
+            catalog: Catalog,
+            jobs: [PruneJob, RescueJob],
+            queues: {
+                demo: { concurrency: 1, pollInterval: "10 millis" },
+            },
+            shutdownGracePeriod: Duration.millis(0),
+            plugins: [
+                pruner({ every: "10 millis", olderThan: Duration.millis(0) }),
+                rescuer({ every: "10 millis", rescueAfter: Duration.millis(0) }),
+            ],
+        });
+
+        const result = await Jobs.runPromise(
+            Effect.gen(function* () {
+                const prune = yield* PruneJob.enqueue({ message: "prune" });
+                const rescue = yield* RescueJob.enqueue({ message: "rescue" });
+                yield* Jobs.worker().pipe(Effect.timeoutOption("90 millis"));
+                const pruned = yield* Job.find(prune.id);
+                const rescued = yield* Job.find(rescue.id);
+
+                return { pruned, rescued };
+            }),
+        );
+
+        expect(Option.isNone(result.pruned)).toBe(true);
+        expect(Option.isSome(result.rescued)).toBe(true);
+
+        if (Option.isSome(result.rescued)) {
+            expect(result.rescued.value.status).toBe("available");
+        }
     });
 });

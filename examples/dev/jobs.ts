@@ -1,19 +1,21 @@
-import { Effect, Layer, Schema } from "effect";
+import { Effect, Schema } from "effect";
 
-import { Job } from "../../src";
+import { JobCatalog, Queue } from "../../src";
 
-export const EchoJob = Job.make({
+export const Catalog = JobCatalog.define({
+    queues: {
+        dev: Queue.define(),
+    },
+});
+
+export const EchoJob = Catalog.job({
     name: "dev.echo",
     queue: "dev",
     payload: Schema.Struct({
         message: Schema.String,
     }),
+    run: ({ payload }) =>
+        Effect.gen(function* () {
+            yield* Effect.logInfo(`processed dev.echo: ${payload.message}`);
+        }),
 });
-
-export const EchoJobLive = EchoJob.toLayer((payload) =>
-    Effect.gen(function* () {
-        yield* Effect.logInfo(`processed dev.echo: ${payload.message}`);
-    }),
-);
-
-export const JobsLive = Layer.mergeAll(EchoJobLive);

@@ -157,7 +157,7 @@ export class JobEngine extends Context.Service<
         readonly fail: (
             id: JobId,
             error: unknown,
-            options?: { readonly runAt?: Date },
+            options?: { readonly runAt?: Date; readonly discard?: boolean },
         ) => Effect.Effect<void, JobStorageError>;
         readonly cancel: (
             id: JobId,
@@ -346,12 +346,16 @@ export const JobEngineMemory = Layer.effect(JobEngine)(
                     jobs.set(id, {
                         ...record,
                         status:
-                            record.attempt < record.maxAttempts
-                                ? "retryable"
-                                : "discarded",
+                            options?.discard === true ||
+                            record.attempt >= record.maxAttempts
+                                ? "discarded"
+                                : "retryable",
                         runAt: options?.runAt ?? record.runAt,
                         discardedAt:
-                            record.attempt < record.maxAttempts ? null : now,
+                            options?.discard === true ||
+                            record.attempt >= record.maxAttempts
+                                ? now
+                                : null,
                         errors: [
                             ...record.errors,
                             ...normalizeErrors(error, record.attempt, now),

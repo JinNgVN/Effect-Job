@@ -15,7 +15,7 @@ import {
 } from "effect";
 
 import { JobEngine } from "./engine";
-import { JobCancelError, JobSnoozeError } from "./job";
+import { JobCancelError, JobDiscardError, JobSnoozeError } from "./job";
 import type { JobName, QueueName, WorkerId } from "./model";
 import { JobNotifier } from "./notifier";
 import { runPluginHooks, type EffectJobPlugin } from "./plugin";
@@ -199,7 +199,7 @@ export const Worker = {
                                         yield* Effect.logInfo(
                                             `Working ${record.value.name}`,
                                         );
-                                        yield* registeredJob.value.run(payload, {
+                                        const context = {
                                             id: record.value.id,
                                             name: record.value.name,
                                             queue: record.value.queue,
@@ -213,6 +213,12 @@ export const Worker = {
                                                 record.value.insertedAt,
                                             attemptedBy:
                                                 record.value.attemptedBy,
+                                        };
+
+                                        yield* registeredJob.value.run({
+                                            payload,
+                                            job: context,
+                                            context,
                                         });
                                     });
                                     const timeout =
@@ -260,6 +266,12 @@ export const Worker = {
                                                 Cause.isFailReason(reason) &&
                                                 reason.error instanceof
                                                 JobSnoozeError,
+                                        );
+                                        const discard = exit.cause.reasons.find(
+                                            (reason) =>
+                                                Cause.isFailReason(reason) &&
+                                                reason.error instanceof
+                                                JobDiscardError,
                                         );
 
                                         if (
@@ -323,22 +335,53 @@ export const Worker = {
                                             return;
                                         }
 
+                                        if (
+                                            discard !== undefined &&
+                                            Cause.isFailReason(discard) &&
+                                            discard.error instanceof JobDiscardError
+                                        ) {
+                                            yield* engine.fail(
+                                                record.value.id,
+                                                discard.error.reason,
+                                                { discard: true },
+                                            );
+                                            const discarded = yield* engine.find(
+                                                record.value.id,
+                                            );
+
+                                            yield* runPluginHooks(
+                                                plugins,
+                                                (plugin) =>
+                                                    Option.isSome(discarded)
+                                                        ? plugin.onJobDiscarded?.({
+                                                            job: discarded.value,
+                                                            error:
+                                                                discard.error
+                                                                    .reason,
+                                                        })
+                                                        : undefined,
+                                            );
+                                            return;
+                                        }
+
+                                        const backoffValue =
+                                            registeredJob.value.job.backoff({
+                                                attempt: record.value.attempt,
+                                                maxAttempts:
+                                                    record.value.maxAttempts,
+                                                error: exit.cause,
+                                                job: record.value,
+                                            });
+                                        const backoff =
+                                            Effect.isEffect(backoffValue)
+                                                ? yield* (backoffValue as Effect.Effect<
+                                                      Duration.Input,
+                                                      never,
+                                                      any
+                                                  >)
+                                                : backoffValue;
                                         const retryAt = new Date(
-                                            Date.now() +
-                                            Duration.toMillis(
-                                                registeredJob.value.job.backoff(
-                                                    {
-                                                        attempt:
-                                                            record.value
-                                                                .attempt,
-                                                        maxAttempts:
-                                                            record.value
-                                                                .maxAttempts,
-                                                        error: exit.cause,
-                                                        job: record.value,
-                                                    },
-                                                ),
-                                            ),
+                                            Date.now() + Duration.toMillis(backoff),
                                         );
 
                                         yield* engine.fail(

@@ -2,12 +2,11 @@
 
 import { Context, Data, Effect, Layer, Option } from "effect";
 
-import type { JobContext, JobDefinition } from "./job";
+import type { JobDefinition, JobRunInput } from "./job";
 import type { JobName } from "./model";
 
 export type JobRun = (
-    payload: any,
-    context: JobContext,
+    input: JobRunInput<any, string>,
 ) => Effect.Effect<any, any, any>;
 
 export interface RegisteredJob {
