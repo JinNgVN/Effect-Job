@@ -96,5 +96,5 @@ const program = Effect.gen(function* () {
     });
 });
 
-await Jobs.runPromise(program.pipe(Effect.provide(Live)));
+await Jobs.runPromise(program.pipe(Effect.provide()));
 await Jobs.dispose();
