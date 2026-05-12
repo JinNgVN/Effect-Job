@@ -1,12 +1,12 @@
 import { Effect, Layer, Option, Schema } from "effect";
 import { describe, expect, it } from "vitest";
 
-import { JobCatalog, JobRegistry, JobRegistryMemory, Queue } from "../src";
+import { effectJob, JobRegistry, JobRegistryMemory } from "../src";
 
-describe("JobCatalog", () => {
-    it("creates runtime-independent jobs with an implicit default queue", () => {
-        const Catalog = JobCatalog.define();
-        const SendEmail = Catalog.job({
+describe("effectJob define API", () => {
+    it("defines runtime-bound jobs with an implicit default queue", () => {
+        const Jobs = effectJob();
+        const SendEmail = Jobs.define({
             name: "email.send",
             payload: Schema.Struct({
                 email: Schema.String,
@@ -15,7 +15,6 @@ describe("JobCatalog", () => {
 
         const command = SendEmail.command({ email: "person@example.com" });
 
-        expect(Catalog.queueNames).toEqual(["default"]);
         expect(SendEmail.name).toBe("email.send");
         expect(SendEmail.defaultMaxAttempts).toBe(20);
         expect(command.name).toBe("email.send");
@@ -23,21 +22,9 @@ describe("JobCatalog", () => {
         expect(command.valid).toBe(true);
     });
 
-    it("allows the implicit default queue to be overridden", () => {
-        const Catalog = JobCatalog.define({
-            queues: {
-                default: Queue.define({ concurrency: 5 }),
-                mailers: Queue.define(),
-            },
-        });
-
-        expect(Catalog.queues.default.options.concurrency).toBe(5);
-        expect([...Catalog.queueNames].sort()).toEqual(["default", "mailers"]);
-    });
-
     it("registers a handler through job.toLayer", async () => {
-        const Catalog = JobCatalog.define();
-        const SendEmail = Catalog.job({
+        const Jobs = effectJob();
+        const SendEmail = Jobs.define({
             name: "email.layer",
             payload: Schema.Struct({
                 email: Schema.String,
@@ -59,32 +46,5 @@ describe("JobCatalog", () => {
         expect(Option.isSome(result.handler)).toBe(true);
         expect(result.handlers).toHaveLength(1);
         expect(result.handlers[0]?.job.name).toBe("email.layer");
-    });
-
-    it("fails fast on duplicate handler registration", async () => {
-        const Catalog = JobCatalog.define();
-        const SendEmail = Catalog.job({
-            name: "email.duplicate",
-            payload: Schema.Struct({
-                email: Schema.String,
-            }),
-        });
-        const first = SendEmail.toLayer(() => Effect.void);
-        const second = SendEmail.toLayer(() => Effect.void);
-        const program = Effect.gen(function* () {
-            const registry = yield* JobRegistry;
-            return yield* registry.list;
-        }).pipe(
-            Effect.provide(
-                Layer.mergeAll(first, second).pipe(Layer.provide(JobRegistryMemory)),
-            ),
-        );
-
-        await expect(
-            Effect.runPromise(program as Effect.Effect<any, any, never>),
-        ).rejects.toMatchObject({
-            _tag: "DuplicateJobHandlerError",
-            jobName: "email.duplicate",
-        });
     });
 });

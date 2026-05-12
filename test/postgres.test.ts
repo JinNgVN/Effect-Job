@@ -14,6 +14,8 @@ describe("postgresRowToJobRecord", () => {
             status: "available",
             priority: 1,
             attempt: 0,
+            executions: 0,
+            snoozes: 0,
             max_attempts: 20,
             run_at: "2026-05-09T01:00:00.000Z",
             idempotency_key: "welcome:person@example.com",
@@ -34,6 +36,9 @@ describe("postgresRowToJobRecord", () => {
             meta: { source: "signup" },
             tags: ["welcome"],
             status: "available",
+            attempt: 0,
+            executions: 0,
+            snoozes: 0,
             maxAttempts: 20,
             idempotencyKey: "welcome:person@example.com",
         });

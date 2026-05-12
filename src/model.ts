@@ -28,7 +28,12 @@ export interface JobRecord {
     readonly tags: ReadonlyArray<string>;
     readonly status: JobStatus;
     readonly priority: number;
+    /** Number of failed executions that consumed retry budget. */
     readonly attempt: number;
+    /** Number of times a worker claimed and started this job. */
+    readonly executions: number;
+    /** Number of intentional deferrals that did not consume retry budget. */
+    readonly snoozes: number;
     readonly maxAttempts: number;
     readonly runAt: Date;
     readonly idempotencyKey: string | null;

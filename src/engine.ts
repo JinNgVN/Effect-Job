@@ -81,7 +81,7 @@ const toJsonSafe = (error: unknown): unknown => {
     return error;
 };
 
-const normalizeErrors = (
+export const normalizeJobErrors = (
     error: unknown,
     attempt: number,
     at: Date,
@@ -239,6 +239,8 @@ export const JobEngineMemory = Layer.effect(JobEngine)(
                                 : "available",
                         priority: job.priority,
                         attempt: 0,
+                        executions: 0,
+                        snoozes: 0,
                         maxAttempts: job.maxAttempts,
                         runAt: job.runAt,
                         idempotencyKey: job.idempotencyKey ?? null,
@@ -305,7 +307,7 @@ export const JobEngineMemory = Layer.effect(JobEngine)(
                     const claimed: JobRecord = {
                         ...record,
                         status: "executing",
-                        attempt: record.attempt + 1,
+                        executions: record.executions + 1,
                         attemptedAt: new Date(),
                         attemptedBy:
                             options?.workerId === undefined
@@ -343,22 +345,25 @@ export const JobEngineMemory = Layer.effect(JobEngine)(
 
                     const now = new Date();
 
+                    const nextAttempt = record.attempt + 1;
+
                     jobs.set(id, {
                         ...record,
                         status:
                             options?.discard === true ||
-                            record.attempt >= record.maxAttempts
+                            nextAttempt >= record.maxAttempts
                                 ? "discarded"
                                 : "retryable",
+                        attempt: nextAttempt,
                         runAt: options?.runAt ?? record.runAt,
                         discardedAt:
                             options?.discard === true ||
-                            record.attempt >= record.maxAttempts
+                            nextAttempt >= record.maxAttempts
                                 ? now
                                 : null,
                         errors: [
                             ...record.errors,
-                            ...normalizeErrors(error, record.attempt, now),
+                            ...normalizeJobErrors(error, nextAttempt, now),
                         ],
                         updatedAt: now,
                     });
@@ -379,7 +384,7 @@ export const JobEngineMemory = Layer.effect(JobEngine)(
                         cancelledAt: now,
                         errors: [
                             ...record.errors,
-                            ...normalizeErrors(reason, record.attempt, now),
+                            ...normalizeJobErrors(reason, record.attempt, now),
                         ],
                         updatedAt: now,
                     });
@@ -396,7 +401,7 @@ export const JobEngineMemory = Layer.effect(JobEngine)(
                         ...record,
                         status: "scheduled",
                         runAt,
-                        maxAttempts: record.maxAttempts + 1,
+                        snoozes: record.snoozes + 1,
                         updatedAt: new Date(),
                     });
                 }),

@@ -18,7 +18,7 @@ import { JobEngine } from "./engine";
 import { JobCancelError, JobDiscardError, JobSnoozeError } from "./job";
 import type { JobName, QueueName, WorkerId } from "./model";
 import { JobNotifier } from "./notifier";
-import { runPluginHooks, type EffectJobPlugin } from "./plugin";
+import { JobPlugins, runPluginHooks } from "./plugin";
 import { JobRegistry } from "./registry";
 
 export class MissingJobHandlerError extends Data.TaggedError(
@@ -39,7 +39,6 @@ export interface WorkerQueueOptions {
 export interface WorkerRunOptions {
     readonly queues?: Readonly<Record<QueueName, WorkerQueueOptions | number>>;
     readonly pollInterval?: Duration.Input;
-    readonly plugins?: ReadonlyArray<EffectJobPlugin>;
     readonly workerId?: WorkerId;
     readonly shutdownGracePeriod?: Duration.Input;
 }
@@ -92,7 +91,7 @@ export const Worker = {
                 const notifier = yield* JobNotifier;
                 const registry = yield* JobRegistry;
                 const queues = normalizeQueues(options);
-                const plugins = options?.plugins ?? [];
+                const plugins = yield* JobPlugins;
                 const workerId = options?.workerId ?? `worker-${randomUUID()}`;
                 const shutdownGracePeriod =
                     options?.shutdownGracePeriod ?? "15 seconds";
@@ -206,6 +205,8 @@ export const Worker = {
                                             meta: record.value.meta,
                                             tags: record.value.tags,
                                             attempt: record.value.attempt,
+                                            executions: record.value.executions,
+                                            snoozes: record.value.snoozes,
                                             maxAttempts:
                                                 record.value.maxAttempts,
                                             runAt: record.value.runAt,
@@ -364,9 +365,10 @@ export const Worker = {
                                             return;
                                         }
 
+                                        const nextAttempt = record.value.attempt + 1;
                                         const backoffValue =
                                             registeredJob.value.job.backoff({
-                                                attempt: record.value.attempt,
+                                                attempt: nextAttempt,
                                                 maxAttempts:
                                                     record.value.maxAttempts,
                                                 error: exit.cause,

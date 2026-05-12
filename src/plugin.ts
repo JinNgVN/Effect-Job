@@ -1,6 +1,6 @@
 // Plugin contracts and lifecycle events.
 
-import { Effect, type Duration, type Layer } from "effect";
+import { Context, Effect, Layer, type Duration } from "effect";
 
 import type { JobRecord } from "./model";
 
@@ -48,7 +48,6 @@ export interface WorkerStartedEvent {
 
 export interface EffectJobPlugin {
     readonly name: string;
-    readonly layer?: Layer.Layer<any, any, any>;
     readonly onWorkerStarted?: (
         event: WorkerStartedEvent,
     ) => Effect.Effect<void, unknown, any>;
@@ -74,6 +73,17 @@ export interface EffectJobPlugin {
         event: JobSnoozedEvent,
     ) => Effect.Effect<void, unknown, any>;
 }
+
+export const JobPlugins = Context.Reference<ReadonlyArray<EffectJobPlugin>>(
+    "effect-job/JobPlugins",
+    {
+        defaultValue: () => [],
+    },
+);
+
+export const JobPluginsLive = (
+    ...plugins: ReadonlyArray<EffectJobPlugin>
+) => Layer.succeed(JobPlugins, plugins);
 
 export const runPluginHook = (
     plugin: EffectJobPlugin,

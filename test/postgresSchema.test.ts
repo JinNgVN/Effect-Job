@@ -13,6 +13,9 @@ describe("postgresMigration", () => {
         expect(migration.up).toContain("meta jsonb NOT NULL");
         expect(migration.up).toContain("tags text[] NOT NULL");
         expect(migration.up).toContain("attempted_by text[] NOT NULL");
+        expect(migration.up).toContain("attempt integer NOT NULL DEFAULT 0");
+        expect(migration.up).toContain("executions integer NOT NULL DEFAULT 0");
+        expect(migration.up).toContain("snoozes integer NOT NULL DEFAULT 0");
         expect(migration.up).toContain(
             "WHERE status IN ('available', 'scheduled', 'retryable')",
         );

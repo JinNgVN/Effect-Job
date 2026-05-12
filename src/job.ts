@@ -54,6 +54,8 @@ export interface JobRunContext<Name extends string = string> {
     readonly meta: Record<string, unknown>;
     readonly tags: ReadonlyArray<string>;
     readonly attempt: number;
+    readonly executions: number;
+    readonly snoozes: number;
     readonly maxAttempts: number;
     readonly runAt: Date;
     readonly insertedAt: Date;
@@ -174,13 +176,6 @@ export interface JobDefinitionOptions<
     readonly rateLimit?: RateLimitOptions<PayloadSchema["Type"]>;
     readonly dashboard?: DashboardOptions<PayloadSchema["Type"]>;
     readonly hooks?: JobHooks<PayloadSchema["Type"], ResultSchema["Type"]>;
-    readonly run?: JobRunHandler<
-        PayloadSchema["Type"],
-        Name,
-        ResultSchema["Type"],
-        unknown,
-        any
-    >;
 }
 
 export interface JobDefinition<
@@ -207,13 +202,6 @@ export interface JobDefinition<
     readonly rateLimit?: RateLimitOptions<PayloadSchema["Type"]>;
     readonly dashboard?: DashboardOptions<PayloadSchema["Type"]>;
     readonly hooks?: JobHooks<PayloadSchema["Type"], ResultSchema["Type"]>;
-    readonly run?: JobRunHandler<
-        PayloadSchema["Type"],
-        Name,
-        ResultSchema["Type"],
-        unknown,
-        any
-    >;
     readonly command: (
         payload: PayloadSchema["Type"],
         options?: JobCommandOptions,
@@ -243,7 +231,7 @@ export interface JobDefinition<
         JobRuntime | PayloadSchema["EncodingServices"]
     >;
     readonly toLayer: <Requirements, Error = unknown>(
-        run?: JobRunHandler<
+        run: JobRunHandler<
             PayloadSchema["Type"],
             Name,
             ResultSchema["Type"],
@@ -606,7 +594,6 @@ export const makeJobDefinition = <
             ? {}
             : { dashboard: options.dashboard }),
         ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
-        ...(options.run === undefined ? {} : { run: options.run }),
         command: (payload: PayloadSchema["Type"], commandOptions?: JobCommandOptions) =>
             makeCommand<Name, PayloadSchema["Type"], ResultSchema["Type"]>(
                 job as JobDefinition<Name, any, any, string>,
@@ -641,7 +628,7 @@ export const makeJobDefinition = <
                 );
             }),
         toLayer: <Requirements, Error = unknown>(
-            run?: JobRunHandler<
+            run: JobRunHandler<
                 PayloadSchema["Type"],
                 Name,
                 ResultSchema["Type"],
@@ -652,15 +639,9 @@ export const makeJobDefinition = <
             Layer.effect(JobRegistry)(
                 Effect.gen(function* () {
                     const registry = yield* JobRegistry;
-                    const handler = run ?? options.run;
-
-                    if (handler === undefined) {
-                        return registry;
-                    }
-
                     yield* registry.register(
                         job as unknown as JobDefinition.Any,
-                        handler as JobRun,
+                        run as JobRun,
                     );
 
                     return registry;

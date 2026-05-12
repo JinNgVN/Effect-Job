@@ -8,18 +8,19 @@
     "scripts": {
         "typecheck": "tsc --noEmit",
         "test": "vitest run",
-        "dev:server": "bun examples/dev/server.ts",
-        "dev:send": "bun examples/dev/send.ts"
+        "smoke:postgres": "bun scripts/postgres-smoke.ts"
     },
     "devDependencies": {
         "@effect/language-service": "^0.85.1",
         "@types/bun": "latest",
         "@types/node": "^25.6.0",
+        "drizzle-kit": "1.0.0-rc.2",
         "typescript": "^6.0.3",
         "vitest": "^4.1.5"
     },
     "dependencies": {
         "@effect/sql-pg": "^4.0.0-beta.60",
+        "drizzle-orm": "1.0.0-rc.2",
         "effect": "^4.0.0-beta.60"
     }
 }

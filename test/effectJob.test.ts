@@ -1,38 +1,41 @@
-import { Duration, Effect, Fiber, Option, Schema } from "effect";
+import { Effect, Fiber, Layer, Option, Schema } from "effect";
 import { describe, expect, it } from "vitest";
 
-import { Job, JobCatalog, JobSystem, Queue, pruner, rescuer } from "../src";
+import {
+    effectJob,
+    Job,
+    JobNotifierMemory,
+    JobPluginsLive,
+    memory,
+    pruner,
+    rescuer,
+} from "../src";
 
-describe("JobSystem", () => {
-    it("wires runtime, inline handlers, and workers from one config object", async () => {
-        const Catalog = JobCatalog.define({
+describe("effectJob runtime", () => {
+    it("wires runtime, handler layers, and workers from one config object", async () => {
+        const Jobs = effectJob({
             queues: {
-                demo: Queue.define(),
+                demo: { concurrency: 1, pollInterval: "10 millis" },
             },
         });
-        const ConfiguredJob = Catalog.job({
+        const ConfiguredJob = Jobs.define({
             name: "demo.configured",
             queue: "demo",
             payload: Schema.Struct({
                 message: Schema.String,
             }),
-            run: ({ payload }) =>
-                Effect.logInfo(`configured handler: ${payload.message}`),
         });
-        const Jobs = JobSystem.memory({
-            catalog: Catalog,
-            jobs: [ConfiguredJob],
-            queues: {
-                demo: { concurrency: 1, pollInterval: "10 millis" },
-            },
-        });
+        const ConfiguredJobLive = ConfiguredJob.toLayer(({ payload }) =>
+            Effect.logInfo(`configured handler: ${payload.message}`),
+        );
+        const Live = Layer.mergeAll(memory(), JobNotifierMemory, ConfiguredJobLive);
 
         const record = await Jobs.runPromise(
             Effect.gen(function* () {
                 const handle = yield* ConfiguredJob.enqueue({ message: "hello" });
-                yield* Jobs.worker().pipe(Effect.timeoutOption("50 millis"));
+                yield* Jobs.run.pipe(Effect.timeoutOption("50 millis"));
                 return yield* Job.find(handle.id);
-            }),
+            }).pipe(Effect.provide(Live)),
         );
 
         await Jobs.dispose();
@@ -41,33 +44,9 @@ describe("JobSystem", () => {
 
         if (Option.isSome(record)) {
             expect(record.value.status).toBe("completed");
-            expect(record.value.attempt).toBe(1);
+            expect(record.value.attempt).toBe(0);
+            expect(record.value.executions).toBe(1);
         }
-    });
-
-    it("supports inline run handlers as beginner sugar", async () => {
-        const Catalog = JobCatalog.define();
-        let handled = false;
-        const InlineJob = Catalog.job({
-            name: "demo.inline",
-            payload: Schema.Struct({ message: Schema.String }),
-            run: ({ payload }) =>
-                Effect.sync(() => {
-                    handled = payload.message === "hello";
-                }),
-        });
-        const Jobs = JobSystem.memory({ catalog: Catalog, jobs: [InlineJob] });
-
-        await Jobs.runPromise(
-            Effect.gen(function* () {
-                yield* InlineJob.enqueue({ message: "hello" });
-                yield* Jobs.worker({ pollInterval: "10 millis" }).pipe(
-                    Effect.timeoutOption("50 millis"),
-                );
-            }),
-        );
-
-        expect(handled).toBe(true);
     });
 
     it("runs plugin lifecycle hooks", async () => {
@@ -76,42 +55,34 @@ describe("JobSystem", () => {
             Effect.sync(() => {
                 events.push(event);
             });
-        const Catalog = JobCatalog.define({
-            queues: {
-                demo: Queue.define(),
-            },
-        });
-        const PluginJob = Catalog.job({
-            name: "demo.plugin",
-            queue: "demo",
-            payload: Schema.Struct({ message: Schema.String }),
-            run: () => Effect.void,
-        });
-        const Jobs = JobSystem.memory({
-            catalog: Catalog,
-            jobs: [PluginJob],
+        const Jobs = effectJob({
             queues: {
                 demo: { concurrency: 1, pollInterval: "10 millis" },
             },
-            plugins: [
-                {
-                    name: "events",
-                    onJobEnqueued: ({ job }) =>
-                        push(`enqueued:${job.name}:${job.status}`),
-                    onWorkerStarted: () => push("worker:started"),
-                    onJobStarted: ({ job }) =>
-                        push(`started:${job.name}:${job.status}`),
-                    onJobCompleted: ({ job }) =>
-                        push(`completed:${job.name}:${job.status}`),
-                },
-            ],
         });
+        const PluginJob = Jobs.define({
+            name: "demo.plugin",
+            queue: "demo",
+            payload: Schema.Struct({ message: Schema.String }),
+        });
+        const PluginJobLive = PluginJob.toLayer(() => Effect.void);
+        const PluginsLive = JobPluginsLive({
+            name: "events",
+            onJobEnqueued: ({ job }) =>
+                push(`enqueued:${job.name}:${job.status}`),
+            onWorkerStarted: () => push("worker:started"),
+            onJobStarted: ({ job }) =>
+                push(`started:${job.name}:${job.status}`),
+            onJobCompleted: ({ job }) =>
+                push(`completed:${job.name}:${job.status}`),
+        });
+        const Live = Layer.mergeAll(memory(), JobNotifierMemory, PluginJobLive, PluginsLive);
 
         await Jobs.runPromise(
             Effect.gen(function* () {
                 yield* PluginJob.enqueue({ message: "hello" });
-                yield* Jobs.worker().pipe(Effect.timeoutOption("50 millis"));
-            }),
+                yield* Jobs.run.pipe(Effect.timeoutOption("50 millis"));
+            }).pipe(Effect.provide(Live)),
         );
 
         expect(events).toEqual([
@@ -123,28 +94,22 @@ describe("JobSystem", () => {
     });
 
     it("wakes workers when a job is inserted", async () => {
-        const Catalog = JobCatalog.define({
-            queues: {
-                demo: Queue.define(),
-            },
-        });
-        const NotifyJob = Catalog.job({
-            name: "demo.notifier",
-            queue: "demo",
-            payload: Schema.Struct({ message: Schema.String }),
-            run: () => Effect.void,
-        });
-        const Jobs = JobSystem.memory({
-            catalog: Catalog,
-            jobs: [NotifyJob],
+        const Jobs = effectJob({
             queues: {
                 demo: { concurrency: 1, pollInterval: "1 hour" },
             },
         });
+        const NotifyJob = Jobs.define({
+            name: "demo.notifier",
+            queue: "demo",
+            payload: Schema.Struct({ message: Schema.String }),
+        });
+        const NotifyJobLive = NotifyJob.toLayer(() => Effect.void);
+        const Live = Layer.mergeAll(memory(), JobNotifierMemory, NotifyJobLive);
 
         const record = await Jobs.runPromise(
             Effect.gen(function* () {
-                const worker = yield* Jobs.worker().pipe(
+                const worker = yield* Jobs.run.pipe(
                     Effect.forkChild({ startImmediately: true }),
                 );
 
@@ -156,7 +121,7 @@ describe("JobSystem", () => {
                 yield* Fiber.interrupt(worker);
 
                 return yield* Job.find(handle.id);
-            }),
+            }).pipe(Effect.provide(Live)),
         );
 
         expect(Option.isSome(record)).toBe(true);
@@ -166,17 +131,11 @@ describe("JobSystem", () => {
         }
     });
 
-    it("reports catalog queues and configured worker queues", async () => {
-        const Catalog = JobCatalog.define({
-            queues: {
-                mailers: Queue.define(),
-                billing: Queue.define(),
-            },
-        });
-        const Jobs = JobSystem.memory({
-            catalog: Catalog,
+    it("reports configured worker queues", async () => {
+        const Jobs = effectJob({
             queues: {
                 mailers: { concurrency: 2 },
+                billing: {},
             },
         });
 
@@ -184,13 +143,13 @@ describe("JobSystem", () => {
 
         expect(queues).toEqual({
             declared: ["billing", "default", "mailers"],
-            workers: ["mailers"],
+            workers: ["billing", "mailers"],
         });
     });
 
     it("exposes advanced surfaces as explicit shells", async () => {
-        const Catalog = JobCatalog.define();
-        const Jobs = JobSystem.memory({ catalog: Catalog });
+        const Jobs = effectJob({
+        });
 
         expect(Jobs.middleware.logging()).toEqual({ name: "logging" });
         expect(Jobs.extension({ name: "tenant-context" })).toEqual({
@@ -208,46 +167,46 @@ describe("JobSystem", () => {
     });
 
     it("can run bundled maintenance plugins", async () => {
-        const Catalog = JobCatalog.define({
-            queues: {
-                demo: Queue.define(),
-            },
-        });
-        const PruneJob = Catalog.job({
-            name: "demo.prune",
-            queue: "demo",
-            payload: Schema.Struct({ message: Schema.String }),
-            run: () => Effect.void,
-        });
-        const RescueJob = Catalog.job({
-            name: "demo.rescue",
-            queue: "demo",
-            payload: Schema.Struct({ message: Schema.String }),
-            run: () => Effect.never,
-        });
-        const Jobs = JobSystem.memory({
-            catalog: Catalog,
-            jobs: [PruneJob, RescueJob],
+        const Jobs = effectJob({
             queues: {
                 demo: { concurrency: 1, pollInterval: "10 millis" },
             },
-            shutdownGracePeriod: Duration.millis(0),
-            plugins: [
-                pruner({ every: "10 millis", olderThan: Duration.millis(0) }),
-                rescuer({ every: "10 millis", rescueAfter: Duration.millis(0) }),
-            ],
+            shutdownGracePeriod: "0 millis",
         });
+        const PruneJob = Jobs.define({
+            name: "demo.prune",
+            queue: "demo",
+            payload: Schema.Struct({ message: Schema.String }),
+        });
+        const RescueJob = Jobs.define({
+            name: "demo.rescue",
+            queue: "demo",
+            payload: Schema.Struct({ message: Schema.String }),
+        });
+        const WorkerLive = Layer.mergeAll(
+            PruneJob.toLayer(() => Effect.void),
+            RescueJob.toLayer(() => Effect.never),
+        );
+        const Live = Layer.mergeAll(
+            memory(),
+            JobNotifierMemory,
+            WorkerLive,
+            JobPluginsLive(
+                pruner({ every: "10 millis", olderThan: "0 millis" }),
+                rescuer({ every: "10 millis", rescueAfter: "0 millis" }),
+            ),
+        );
 
         const result = await Jobs.runPromise(
             Effect.gen(function* () {
                 const prune = yield* PruneJob.enqueue({ message: "prune" });
                 const rescue = yield* RescueJob.enqueue({ message: "rescue" });
-                yield* Jobs.worker().pipe(Effect.timeoutOption("90 millis"));
+                yield* Jobs.run.pipe(Effect.timeoutOption("90 millis"));
                 const pruned = yield* Job.find(prune.id);
                 const rescued = yield* Job.find(rescue.id);
 
                 return { pruned, rescued };
-            }),
+            }).pipe(Effect.provide(Live)),
         );
 
         expect(Option.isNone(result.pruned)).toBe(true);

@@ -68,6 +68,7 @@ During early development, one package is acceptable. Internally, keep boundaries
 - Do not build a workflow engine.
 - Do not support MySQL, SQLite, Turso, DynamoDB, Redis-backed jobs, or SQS in v1.
 - Do not expose multiple public engines in the first API.
+- Do not expose Basic/Smart-style engine selection; the runtime should be the best engine.
 - Do not make users choose an engine for normal use.
 - Do not expose Ecto-style changesets.
 - Do not make Drizzle a hard requirement for application code.
@@ -76,104 +77,126 @@ During early development, one package is acceptable. Internally, keep boundaries
 
 ## 5. Decision Log
 
-### 5.1 Runtime-Independent Job Definitions
+### 5.1 Runtime-First Job Definitions
 
-Job definitions should not be created from a configured database runtime.
+Job definitions should be created from a configured runtime instance.
 
 Use this:
 
 ```ts
-const Catalog = JobCatalog.define({
+const Jobs = effectJob({
   queues: {
-    default: Queue.define(),
-    mailers: Queue.define(),
+    default: {},
+    mailers: {},
   },
 })
 
-const SendEmail = Catalog.job({
+const SendEmail = Jobs.define({
   name: "email.send",
   queue: "mailers",
   payload: SendEmailPayload,
-  run,
-})
-
-const Jobs = JobSystem.postgres({
-  url: process.env.DATABASE_URL!,
-  catalog: Catalog,
-  jobs: [SendEmail],
 })
 ```
 
-Avoid this as the primary API:
-
-```ts
-const Jobs = JobSystem.postgres(...)
-const SendEmail = Jobs.job(...)
-```
+Avoid a separate catalog object or backend-specific runtime factory as the primary API.
 
 Why:
 
-- Job definitions can live in shared packages.
-- Producers and workers can import the same definitions.
-- Tests can use the same definitions with manual or inline runtimes.
-- Runtime config can differ by environment without redefining jobs.
+- Queue names become type-safe from the actual runtime config.
+- Separate catalog objects and job lists disappear from normal usage.
+- The runtime owns queue behavior, commands, and worker lifecycle from one object.
+- Storage, plugins, telemetry, notifiers, and custom integrations are ordinary Effect services/layers.
+- Shared job modules can export a function that receives the runtime and returns definitions.
 
-### 5.2 Type-Safe Queues Through Catalogs
+### 5.2 Type-Safe Queues Through Runtime Config
 
-Queues should be type-safe. The catalog defines known queues, and jobs can only use those queues unless they explicitly opt into dynamic queues.
+Queues should be type-safe. The runtime config defines known queues, and jobs can only use those queues unless they explicitly opt into dynamic queues.
 
 ```ts
-const Catalog = JobCatalog.define({
+const Jobs = effectJob({
   queues: {
-    default: Queue.define(),
-    mailers: Queue.define(),
-    webhooks: Queue.define(),
-    media: Queue.define(),
+    default: {},
+    mailers: {},
+    webhooks: {},
+    media: {},
   },
 })
 
-const SendEmail = Catalog.job({
+const SendEmail = Jobs.define({
   name: "email.send",
   queue: "mailers",
   payload,
-  run,
 })
 ```
 
 Typos should fail at compile time:
 
 ```ts
-Catalog.job({
+Jobs.define({
   name: "email.send",
   queue: "mailer",
   payload,
-  run,
 })
 ```
 
 Dynamic queue policies can still be type-safe:
 
 ```ts
-const NotifyUser = Catalog.job({
+const NotifyUser = Jobs.define({
   name: "user.notify",
   queue: ({ payload }) => payload.urgent ? "webhooks" : "mailers",
   payload: NotifyPayload,
-  run,
 })
 ```
 
 Truly dynamic queues require an explicit escape hatch:
 
 ```ts
-const TenantJob = Catalog.job({
+const TenantJob = Jobs.define({
   name: "tenant.work",
   queue: ({ payload }) => Queue.dynamic(`tenant:${payload.tenantId}`),
   payload: TenantPayload,
-  run,
 })
 ```
 
-### 5.3 `enqueue` Is The Happy Path
+Queue selection belongs on the job definition. Queue behavior such as concurrency, rate limits, pausing, and worker capacity belongs in runtime config because queues are shared runtime resources.
+
+### 5.3 Default Queue Behavior
+
+The runtime should include a default queue automatically:
+
+```ts
+const Jobs = effectJob({
+})
+
+const SendEmail = Jobs.define({
+  name: "email.send",
+  payload,
+})
+```
+
+This should behave as if the user configured:
+
+```ts
+queues: {
+  default: { concurrency: 10 },
+}
+```
+
+Advanced users can disable the implicit default queue:
+
+```ts
+const Jobs = effectJob({
+  defaultQueue: false,
+  queues: {
+    mailers: { concurrency: 20 },
+  },
+})
+```
+
+If `defaultQueue: false`, `Jobs.define` must require an explicit queue from the configured queue names or an explicit dynamic queue escape hatch.
+
+### 5.4 `enqueue` Is The Happy Path
 
 The common API should be:
 
@@ -183,7 +206,7 @@ yield* SendEmail.enqueue(payload, options)
 
 This means "validate this payload, resolve options, insert a durable job, notify workers, and return a handle."
 
-### 5.4 Keep The Two-Step Command Path
+### 5.5 Keep The Two-Step Command Path
 
 Oban has `Worker.new(...) |> Oban.insert(...)` because it builds an Ecto changeset and then persists it.
 
@@ -213,7 +236,7 @@ The command path enables:
 - Workflow adapters.
 - Tests.
 
-### 5.5 Use `command`, Not `make`
+### 5.6 Use `command`, Not `make`
 
 Use:
 
@@ -229,7 +252,7 @@ SendEmail.make(payload)
 
 Reason: `make` is vague and can be confused with job definition. `command` clearly means "build a typed insert command."
 
-### 5.6 Postgres First
+### 5.7 Postgres First
 
 The first production backend is Postgres only.
 
@@ -247,7 +270,7 @@ Reasons:
 
 Other databases can come later behind an internal storage boundary.
 
-### 5.7 Drizzle First, But Not Drizzle-Only
+### 5.8 Drizzle First, But Not Drizzle-Only
 
 Drizzle should be the first TypeScript database integration because it is TypeScript-native, close to SQL, supports Postgres well, and has a migration story.
 
@@ -256,57 +279,58 @@ But the product should not be "a Drizzle job queue."
 The public stance:
 
 ```ts
-JobSystem.postgres(...)
+const Jobs = effectJob({ queues })
+
+const Live = Layer.mergeAll(
+  PgClient.layer({ url }),
+  JobEnginePostgres.layer(),
+)
 ```
 
-Drizzle integration is an option/helper:
+Drizzle integration is for schema and migration ergonomics:
 
 ```ts
-JobSystem.postgres({
-  drizzle: db,
-})
+// drizzle-kit generate
+// drizzle-kit migrate
 ```
 
-Hot-path runtime operations may use optimized SQL through Drizzle's SQL escape hatch or Effect SQL. Drizzle should help with schema, migrations, transaction interop, and developer ergonomics, but it must not limit the queue engine.
+Hot-path runtime operations should use `@effect/sql-pg` and optimized SQL. Drizzle should help with schema and migrations, but it must not limit the queue engine.
 
-### 5.8 Memory Is For Tests, Not A Production Backend
+### 5.9 Memory Is For Tests, Not A Production Backend
 
 Keep manual/inline/memory behavior for tests. Do not present memory as an equal production backend.
 
-### 5.9 Support Runtime Roles
+### 5.10 Producer And Worker Processes
 
-Real deployments often split producers and workers.
+Real deployments often split producers and workers, but the public API does not
+need a `role` flag initially.
 
-Support roles:
-
-```ts
-role: "producer" | "worker" | "all"
-```
-
-Examples:
+The behavior is enough:
 
 ```ts
-const ProducerJobs = JobSystem.postgres({
-  url,
-  catalog: Catalog,
-  role: "producer",
-})
+// Producer process: imports job contracts and enqueues rows.
+yield* SendEmail.enqueue(payload)
+
+// Worker process: provides handler layers and runs worker loops.
+yield* Jobs.run.pipe(Effect.provide(SendEmailLive))
 ```
+
+A web server can enqueue without calling `Jobs.run`. A worker process can call
+`Jobs.run` and provide handlers. A local development process can do both.
+
+Later, the runtime may expose node identity for dashboards, orphan rescue, and
+cluster health:
 
 ```ts
-const WorkerJobs = JobSystem.postgres({
-  url,
-  catalog: Catalog,
-  jobs: [SendEmail, DeliverWebhook],
-  role: "worker",
-  queues: {
-    mailers: { concurrency: 20 },
-    webhooks: { concurrency: 50 },
-  },
-})
+node: {
+  id: process.env.HOSTNAME ?? "worker-1",
+}
 ```
 
-### 5.10 Dashboard Primitives Belong In Core
+This means "which running server/container/process claimed or executed this
+job." It is not a user-facing worker role.
+
+### 5.11 Dashboard Primitives Belong In Core
 
 Even if the dashboard is commercial later, the core runtime should emit the data needed for an excellent dashboard:
 
@@ -329,59 +353,43 @@ Even if the dashboard is commercial later, the core runtime should emit the data
 
 ```ts
 import { Effect, Schema } from "effect"
-import { JobCatalog, JobSystem, Queue } from "effect-job"
+import { effectJob, postgres } from "effect-job"
 
-const Catalog = JobCatalog.define({
+const Jobs = effectJob({
   queues: {
-    default: Queue.define(),
+    default: {},
   },
 })
 
-const SendEmail = Catalog.job({
+const SendEmail = Jobs.define({
   name: "email.send",
   payload: Schema.Struct({
     userId: Schema.String,
     email: Schema.String,
   }),
-  run: ({ payload }) =>
-    Effect.gen(function* () {
-      const email = yield* EmailService
-      yield* email.send(payload.userId, payload.email)
-    }),
 })
 
-const Jobs = JobSystem.postgres({
-  url: process.env.DATABASE_URL!,
-  catalog: Catalog,
-  jobs: [SendEmail],
-})
+const SendEmailLive = SendEmail.toLayer(({ payload }) =>
+  Effect.gen(function* () {
+    const email = yield* EmailService
+    yield* email.send(payload.userId, payload.email)
+  }),
+)
 
 yield* SendEmail.enqueue({
   userId: "user_123",
   email: "person@example.com",
 })
+
+yield* Jobs.run.pipe(Effect.provide(SendEmailLive))
 ```
 
-The catalog can include an implicit `default` queue for the simplest setup, but explicit queues should be encouraged for production.
+The runtime can include an implicit `default` queue for the simplest setup, but explicit queues should be encouraged for production.
 
 ### 6.2 Production Setup
 
 ```ts
-const Catalog = JobCatalog.define({
-  queues: {
-    default: Queue.define(),
-    mailers: Queue.define(),
-    webhooks: Queue.define(),
-    media: Queue.define(),
-  },
-})
-
-const Jobs = JobSystem.postgres({
-  url: process.env.DATABASE_URL!,
-  catalog: Catalog,
-  jobs: [SendEmail, DeliverWebhook, ResizeImage],
-  role: "all",
-  preset: "balanced",
+const Jobs = effectJob({
   queues: {
     default: { concurrency: 10 },
     mailers: { concurrency: 25 },
@@ -396,17 +404,29 @@ const Jobs = JobSystem.postgres({
     },
     media: { concurrency: 2 },
   },
-  defaults: {
-    attempts: 20,
-    timeout: "5 minutes",
-  },
+  pollInterval: "1 second",
+  shutdownGracePeriod: "15 seconds",
 })
+
+const Live = Layer.mergeAll(
+  PgClient.layer({
+    url: Redacted.make(process.env.DATABASE_URL!),
+  }),
+  JobEnginePostgres.layer({
+    schema: "public",
+    table: "effect_jobs",
+  }),
+  JobPluginsLive(
+    pruner({ every: "1 hour", olderThan: "7 days" }),
+    rescuer({ every: "1 minute", rescueAfter: "30 minutes" }),
+  ),
+)
 ```
 
 ### 6.3 Job Definition
 
 ```ts
-const DeliverWebhook = Catalog.job({
+const DeliverWebhook = Jobs.define({
   name: "webhook.deliver",
   queue: "webhooks",
   payload: Schema.Struct({
@@ -461,26 +481,28 @@ const DeliverWebhook = Catalog.job({
       url: payload.url,
     }),
   },
-  run: ({ payload }) =>
-    Effect.gen(function* () {
-      const http = yield* HttpClient
-      const startedAt = Date.now()
-      const response = yield* http.post(payload.url, { json: payload.body })
-
-      if (response.status === 429) {
-        return yield* Jobs.snooze("10 minutes", "Endpoint rate limited")
-      }
-
-      if (response.status >= 400 && response.status < 500) {
-        return yield* Jobs.discard(`Permanent HTTP ${response.status}`)
-      }
-
-      return {
-        status: response.status,
-        durationMs: Date.now() - startedAt,
-      }
-    }),
 })
+
+const DeliverWebhookLive = DeliverWebhook.toLayer(({ payload }) =>
+  Effect.gen(function* () {
+    const http = yield* HttpClient
+    const startedAt = Date.now()
+    const response = yield* http.post(payload.url, { json: payload.body })
+
+    if (response.status === 429) {
+      return yield* Jobs.snooze("10 minutes", "Endpoint rate limited")
+    }
+
+    if (response.status >= 400 && response.status < 500) {
+      return yield* Jobs.discard(`Permanent HTTP ${response.status}`)
+    }
+
+    return {
+      status: response.status,
+      durationMs: Date.now() - startedAt,
+    }
+  }),
+)
 ```
 
 ### 6.4 Command And Enqueue API
@@ -696,13 +718,195 @@ The API must keep these separate:
 
 Do not merge these into one overloaded feature.
 
-## 11. Oban Pro-Inspired Dynamic Features
+## 11. Advanced Runtime Direction
 
-We should learn from Oban Pro's dynamic features and support the same category of production needs in an open-source-friendly way.
+We should learn from Oban Pro's production lessons, but not copy its product split or public shape. The public model should be one best runtime:
 
-### 11.1 Dynamic Queues
+```ts
+const Jobs = effectJob({
+  queues,
+})
+```
 
-Static queues come from the catalog and runtime config. Dynamic queues are stored in the database and can be changed at runtime.
+Avoid exposing multiple public engines:
+
+```ts
+engine: "basic" | "smart"
+```
+
+The runtime should always be designed as the advanced engine. Advanced behavior should be dormant until configured, not hidden behind a paid or alternative engine.
+
+### 11.1 What To Learn From Oban Pro
+
+Oban Pro's advanced features show what serious production job systems eventually need:
+
+- Global concurrency across nodes.
+- Partitioned concurrency for tenants, accounts, workers, or payload keys.
+- Rate limits with multiple algorithms and per-job weights.
+- Async/batched acknowledgement to reduce database pressure.
+- Fast uniqueness that works safely across processes and nodes.
+- Bulk inserts with batching, conflict modes, and optional spacing.
+- Accurate snooze semantics distinct from failed attempts.
+- Dynamic queues, dynamic cron, dynamic pruning, rescue/lifeline behavior, and prioritization.
+- Batch, chunk, relay/awaitable jobs, and workflow-style composition.
+- Testing helpers, output/result recording, deadlines, hooks, encrypted/structured args, and dashboard-oriented visibility.
+
+These should inform our schema, command model, policy model, and adapter boundaries from the beginning.
+
+### 11.2 What We Can Do Better
+
+Effect lets us design a cleaner and more typed system:
+
+- Use Effect Schema for payloads, results, and safe dashboard projections.
+- Use `Layer` for handler registration and dependencies.
+- Make policies, hooks, middleware, and extensions Effectful.
+- Make explainability a core API, not a dashboard-only feature.
+- Treat workflow and cluster support as adapters to Effect Workflow and Effect Cluster, not as a custom workflow engine or distributed worker protocol.
+- Keep Postgres as durable truth while making notifier, rate limit, archive, search, telemetry, realtime, and execution placement replaceable ports.
+
+### 11.3 Advanced Queue Config Shape
+
+Queue config should reserve room for production controls even if early implementations ignore some fields:
+
+```ts
+const Jobs = effectJob({
+  queues: {
+    webhooks: {
+      concurrency: 50,
+      globalConcurrency: 500,
+      partitionedConcurrency: {
+        key: ({ payload }) => ["account", payload.accountId],
+        limit: 2,
+        scope: "global",
+        fairness: "oldest-first",
+      },
+      rateLimit: {
+        key: ({ payload }) => ["account", payload.accountId],
+        limit: 100,
+        per: "10 seconds",
+        algorithm: "sliding-window",
+        weight: ({ payload }) => payload.weight ?? 1,
+      },
+      acknowledgements: {
+        mode: "batched",
+        flushEvery: "50 millis",
+        maxBatchSize: 500,
+      },
+    },
+  },
+})
+```
+
+Design rules:
+
+- Queue config controls execution capacity and shared runtime behavior.
+- Job config controls job-type policy.
+- Enqueue options override one inserted command.
+- Effective precedence is: enqueue options > job definition > queue policy > library baseline behavior.
+
+### 11.4 Advanced Job Definition Shape
+
+Job definitions should stay declarative and separate from handler implementation:
+
+```ts
+const DeliverWebhook = Jobs.define({
+  name: "webhook.deliver",
+  queue: "webhooks",
+  payload: WebhookPayload,
+  result: WebhookResult,
+  attempts: {
+    max: 20,
+    classify: ({ error }) =>
+      error instanceof PermanentWebhookError ? "discard" : "retry",
+  },
+  unique: {
+    key: ({ payload }) => ["webhook", payload.endpointId, payload.eventId],
+    while: ["scheduled", "available", "executing", "retryable"],
+    for: "forever",
+    conflict: "use-existing",
+  },
+  concurrency: {
+    key: ({ payload }) => ["endpoint", payload.endpointId],
+    limit: 1,
+    scope: "global",
+  },
+  rateLimit: {
+    key: ({ payload }) => ["account", payload.accountId],
+    weight: ({ payload }) => payload.weight ?? 1,
+  },
+  dashboard: {
+    title: ({ payload }) => `Webhook ${payload.eventId}`,
+    dimensions: {
+      account: ({ payload }) => payload.accountId,
+      endpoint: ({ payload }) => payload.endpointId,
+    },
+    publicPayload: ({ payload }) => ({
+      accountId: payload.accountId,
+      endpointId: payload.endpointId,
+      eventId: payload.eventId,
+      url: payload.url,
+    }),
+  },
+})
+
+const DeliverWebhookLive = DeliverWebhook.toLayer(handler)
+```
+
+Do not bring inline `run` back as the primary design. `toLayer` is how handlers register themselves in `JobRegistry` and compose with Effect services.
+
+### 11.5 Advanced Data Model Requirements
+
+The schema should not be limited to the current prototype record shape. The design target should track these separately:
+
+```txt
+state             # scheduled, available, executing, retryable, completed, cancelled, discarded, suspended
+attempts          # failures that consume retry budget
+executions        # total worker starts
+snoozes           # intentional deferrals
+max_attempts
+result
+public_payload
+dashboard_dimensions
+unique_key
+concurrency_key
+rate_limit_key
+ordering_key
+idempotency_key
+blocked_reason
+node_id
+lease_expires_at
+```
+
+This supports accurate snooze, explainability, dashboard timelines, idempotency, result forwarding, relay/awaitable jobs, concurrency/rate-limit accounting, and future batch/chunk primitives.
+
+### 11.6 Advanced Features As Layers On The Same Engine
+
+Later advanced APIs should build on commands, events, result storage, and dynamic config instead of introducing a second engine:
+
+```ts
+yield* SendEmail.enqueue(payload)
+yield* SendEmail.enqueueMany(payloads, { chunkSize: 1_000 })
+yield* Jobs.batches.create({ name: "import.contacts" })
+yield* Jobs.relay.enqueueAndAwait(GenerateReport.command(payload))
+yield* Jobs.queues.pause("webhooks")
+yield* Jobs.schedules.upsert(schedule)
+yield* Jobs.explain.job(jobId)
+```
+
+Composition primitives:
+
+- Batch: group jobs, track progress, emit callbacks/events.
+- Chunk: process groups atomically by size/time/partition.
+- Relay: enqueue durable work and await typed result from any node.
+- Workflow bridge: adapt jobs to Effect Workflow and workflows to jobs without owning orchestration semantics.
+
+### 11.7 Dynamic Runtime Features
+
+Dynamic features should support the same category of production needs as Oban Pro, but with Effect-native APIs and explainable database-backed config.
+
+### 11.8 Dynamic Queues
+
+Static queues come from runtime config. Dynamic queues are stored in the database and can be changed at runtime.
 
 Use cases:
 
@@ -729,14 +933,14 @@ yield* Jobs.queues.scaleGlobal("webhooks", { concurrency: 1_000 })
 
 Dynamic queue config should be versioned and audited.
 
-### 11.2 Dynamic Schedules
+### 11.9 Dynamic Schedules
 
 Cron/scheduled recurring jobs should support static definitions and dynamic DB-backed definitions.
 
 Static:
 
 ```ts
-const Schedules = Catalog.schedules({
+const Schedules = Jobs.schedules.define({
   nightlyCleanup: {
     cron: "0 0 * * *",
     timezone: "Etc/UTC",
@@ -762,7 +966,7 @@ yield* Jobs.schedules.upsert({
 
 Recurring jobs should be inserted by the leader only, with per-tick uniqueness.
 
-### 11.3 Dynamic Limits
+### 11.10 Dynamic Limits
 
 Runtime limits should be mutable without deploys:
 
@@ -776,7 +980,7 @@ Runtime limits should be mutable without deploys:
 
 Dynamic limit changes should affect new dispatch decisions quickly and should be visible in diagnostics.
 
-### 11.4 Dynamic Maintenance
+### 11.11 Dynamic Maintenance
 
 Maintenance settings may become dynamic later:
 
@@ -787,7 +991,7 @@ Maintenance settings may become dynamic later:
 
 Early versions can keep these static, but the schema should not block dynamic control later.
 
-### 11.5 Dynamic Config Architecture
+### 11.12 Dynamic Config Architecture
 
 Use a database-backed control table for dynamic config:
 
@@ -804,45 +1008,43 @@ Requirements:
 - Record actor/source.
 - Broadcast updates to workers.
 - Fall back to polling if notifications fail.
-- Validate dynamic config against catalog and runtime capabilities.
+- Validate dynamic config against runtime definitions and capabilities.
 - Make config changes explainable in the dashboard.
 
 ## 12. Runtime Configuration
 
-### 12.1 Presets
-
-Provide presets to reduce initial config burden:
+### 12.1 Postgres Runtime Layer
 
 ```ts
-preset: "simple" | "balanced" | "throughput" | "strict"
-```
-
-Suggested meanings:
-
-- `simple`: low ceremony, local-friendly defaults.
-- `balanced`: production-friendly defaults.
-- `throughput`: batching and DB-pressure-aware defaults.
-- `strict`: conservative timeouts, stronger validation, safer retry behavior.
-
-### 12.2 Postgres Config
-
-```ts
-const Jobs = JobSystem.postgres({
-  url: process.env.DATABASE_URL!,
-  schema: "public",
-  tablePrefix: "effect_jobs",
-  migrate: "safe",
-  poolSize: 10,
-  statementTimeout: "15 seconds",
+const Jobs = effectJob({
+  queues,
 })
+
+const Live = Layer.mergeAll(
+  PgClient.layer({
+    url: Redacted.make(process.env.DATABASE_URL!),
+  }),
+  JobEnginePostgres.layer({
+    schema: "public",
+    table: "effect_jobs",
+  }),
+)
 ```
 
-### 12.3 Drizzle Config
+Postgres runtime access should use `@effect/sql-pg`. The job library should not
+wrap pool config, SSL config, transaction behavior, or connection lifecycle.
+
+### 12.2 Drizzle Migration Config
 
 ```ts
-const Jobs = JobSystem.postgres({
-  drizzle: db,
-  catalog: Catalog,
+// drizzle.config.ts
+export default defineConfig({
+  schema: "./src/db/schema.ts",
+  out: "./drizzle",
+  dialect: "postgresql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+  },
 })
 ```
 
@@ -1308,7 +1510,7 @@ const SendEmailActivity = SendEmail.asWorkflowActivity({
 Workflow starter as job:
 
 ```ts
-const StartOnboardingWorkflow = Catalog.fromWorkflow({
+const StartOnboardingWorkflow = Jobs.fromWorkflow({
   name: "workflow.onboarding.start",
   workflow: OnboardingWorkflow,
   payload: OnboardingPayload,
@@ -1422,16 +1624,16 @@ yield* Jobs.jobs.snooze(jobId, { until: new Date(Date.now() + 60_000) })
 Current prototype concepts map roughly as follows:
 
 ```txt
-Job.make                 -> Catalog.job
+Job.make                 -> Jobs.define
 job.new                  -> job.command
 Job.insert               -> Jobs.insert
-effectJob(config)        -> JobSystem.postgres(config)
+backend-specific factory -> effectJob({ queues }) + JobEnginePostgres.layer()
 Worker.run               -> Jobs.run / worker runtime
 JobEngine                -> internal JobStorage
-JobRegistry              -> catalog + runtime job registry
-plugins                  -> extensions / maintenance / dynamic features
-memory()                 -> test runtime only
-postgres()               -> Postgres runtime implementation
+JobRegistry              -> handler registry used by job.toLayer
+plugins                  -> JobPluginsLive(...) service layer
+memory()                 -> test JobEngine layer
+postgres()               -> Postgres JobEngine layer requiring PgClient
 ```
 
 Breaking changes are acceptable. Do not preserve the old API unless it is nearly free.
@@ -1441,35 +1643,38 @@ Breaking changes are acceptable. Do not preserve the old API unless it is nearly
 Recommended order:
 
 1. Domain model.
-2. `JobCatalog.define` and type-safe queues.
-3. `Catalog.job` definitions.
+2. `effectJob({ queues })` and type-safe runtime queues.
+3. `Jobs.define` definitions.
 4. `Job.command`, `Job.enqueue`, `Jobs.insert` API skeleton.
-5. Policy resolver.
-6. Manual/inline test runtime.
-7. Postgres schema and migrations.
-8. Postgres insert/list/get.
-9. Worker fetch using `FOR UPDATE SKIP LOCKED`.
-10. Execute/complete/fail/retry/discard/cancel/snooze.
-11. Events table.
-12. Basic diagnostics.
-13. Queue controls.
-14. Dynamic queue/schedule foundations.
-15. Dashboard projections and query APIs.
-16. Batched acknowledgements.
-17. Global concurrency/rate limits.
-18. Advanced dashboard/search/analytics adapters.
+5. `Job.toLayer` handler registration through `JobRegistry`.
+6. Policy resolver.
+7. Manual/inline test runtime.
+8. Postgres schema and migrations.
+9. Postgres insert/list/get.
+10. Worker fetch using `FOR UPDATE SKIP LOCKED`.
+11. Execute/complete/fail/retry/discard/cancel/snooze.
+12. Attempts/executions/snoozes separation.
+13. Events table and result storage.
+14. Basic diagnostics and `Jobs.explain`.
+15. Queue controls.
+16. Dynamic queue/schedule foundations.
+17. Dashboard projections and query APIs.
+18. Batched acknowledgements.
+19. Global concurrency, partitioned concurrency, and rate limits.
+20. Batch/chunk/relay foundations.
+21. Advanced dashboard/search/analytics adapters.
 
 ## 24. Initial Milestones
 
 ### Milestone 1: API Skeleton
 
-- `JobCatalog.define`.
-- `Queue.define`.
-- `Catalog.job`.
+- `effectJob({ queues })`.
+- Engine layers such as `JobEnginePostgres.layer(...)` and `JobEngineMemory.layer()`.
+- `Jobs.define`.
 - `Job.command`.
 - `Job.enqueue`.
-- `JobSystem.postgres` type shell.
 - `Jobs.insert` API shell.
+- `Job.toLayer` handler registration.
 - Manual test runtime.
 
 ### Milestone 2: Basic Postgres Runtime
@@ -1489,10 +1694,12 @@ Recommended order:
 - Rescue orphaned jobs.
 - Pruning/retention.
 - LISTEN/NOTIFY plus polling fallback.
+- Attempts/executions/snoozes tracked separately.
+- Events table and basic result storage.
 - Queue pause/resume.
 - Diagnostics.
 
-### Milestone 4: Advanced Runtime
+### Milestone 4: Advanced Runtime Foundations
 
 - Global concurrency.
 - Partitioned concurrency.
@@ -1500,6 +1707,7 @@ Recommended order:
 - Batched acknowledgements.
 - Dynamic queues.
 - Dynamic schedules.
+- Explainable blocked reasons.
 
 ### Milestone 5: Dashboard Foundation
 
@@ -1511,17 +1719,24 @@ Recommended order:
 - Queue health.
 - Realtime stream.
 
+### Milestone 6: Advanced Composition
+
+- Batch progress tracking.
+- Chunked job processing.
+- Relay/awaitable jobs with typed results.
+- Effect Workflow adapters.
+- Effect Cluster execution adapter.
+
 ## 25. Open Questions
 
-- Should `JobCatalog.define()` include `default` automatically?
-- Should `Catalog.job` require `queue`, or default to `default`?
 - What should the exact `JobCommand` type expose publicly?
 - Should `Jobs.resolve(command)` validate schema immediately or also resolve all policies?
 - Should dashboard basic UI be open source while advanced dashboard is commercial?
 - Which license should the core use: MIT or Apache-2.0?
 - Should Drizzle schema helpers live in core initially or a separate package from day one?
 - How much dynamic queue support should land before v1?
-- Should global concurrency/rate limits be v1 or v1.x?
+- Should global concurrency/rate limits be v1 or v1.x, if the schema foundations are v1?
+- Which advanced composition primitive comes first: batch, chunk, or relay?
 
 ## 26. Design Principle
 

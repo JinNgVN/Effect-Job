@@ -1,37 +1,27 @@
 import { Data, Effect, Layer, ManagedRuntime, Option, Schema } from "effect";
 
-import type { JobCatalog } from "./catalog";
-import { JobEngineMemory } from "./engine";
 import {
     insertJobCommand,
-    insertJobCommands,
     Job,
     JobCancelError,
     JobDiscardError,
     type JobCommand,
     type JobDefinition,
+    type JobDefinitionOptions,
     type JobHandle,
     JobRuntime,
     JobSnoozeError,
+    makeJobDefinition,
     resolveJobCommand,
     type InsertError,
     type ResolvedJobCommand,
 } from "./job";
 import type { JobId, QueueName } from "./model";
-import { JobNotifierMemory } from "./notifier";
-import { runPluginHooks, type EffectJobPlugin } from "./plugin";
+import { JobPlugins, runPluginHooks } from "./plugin";
 import { JobRegistry, JobRegistryMemory } from "./registry";
-import { postgres as postgresDatabase, type PostgresDatabaseInput } from "./databases/postgres";
 import { Worker, type WorkerRunOptions } from "./worker";
 
-export type JobSystemRole = "producer" | "worker" | "all";
-
-export interface JobSystemDefaults {
-    readonly attempts?: number;
-    readonly timeout?: string;
-}
-
-export interface JobSystemQueueOptions {
+export interface EffectJobQueueOptions {
     readonly concurrency?: number;
     readonly globalConcurrency?: number;
     readonly rateLimit?: {
@@ -41,30 +31,20 @@ export interface JobSystemQueueOptions {
     };
 }
 
-export interface JobSystemBaseConfig<Catalog extends JobCatalog<any> = JobCatalog<any>> {
-    readonly catalog: Catalog;
-    readonly jobs?: ReadonlyArray<JobDefinition.Any>;
-    readonly layers?: ReadonlyArray<Layer.Layer<any, any, any>>;
-    readonly plugins?: ReadonlyArray<EffectJobPlugin>;
-    readonly role?: JobSystemRole;
-    readonly preset?: "minimal" | "balanced" | "throughput";
-    readonly queues?: WorkerRunOptions["queues"];
-    readonly defaults?: JobSystemDefaults;
+export type JobRuntimeQueueOptions =
+    NonNullable<WorkerRunOptions["queues"]>[string];
+
+export type JobRuntimeQueues = Readonly<Record<string, JobRuntimeQueueOptions>>;
+
+export type JobRuntimeQueueNames<Queues extends JobRuntimeQueues> =
+    | "default"
+    | Extract<keyof Queues, string>;
+
+export interface JobRuntimeConfig<Queues extends JobRuntimeQueues = JobRuntimeQueues> {
+    readonly queues?: Queues;
     readonly pollInterval?: WorkerRunOptions["pollInterval"];
-    readonly workerId?: WorkerRunOptions["workerId"];
     readonly shutdownGracePeriod?: WorkerRunOptions["shutdownGracePeriod"];
 }
-
-export interface JobSystemPostgresConfig<Catalog extends JobCatalog<any> = JobCatalog<any>>
-    extends JobSystemBaseConfig<Catalog> {
-    readonly url?: string;
-    readonly database?: PostgresDatabaseInput;
-    readonly schema?: string;
-    readonly table?: string;
-}
-
-export interface JobSystemMemoryConfig<Catalog extends JobCatalog<any> = JobCatalog<any>>
-    extends JobSystemBaseConfig<Catalog> {}
 
 export interface QueueInfo {
     readonly declared: ReadonlyArray<QueueName>;
@@ -109,7 +89,7 @@ export class JobFeatureNotImplementedError extends Data.TaggedError(
     "JobFeatureNotImplementedError",
 )<{
     readonly feature: string;
-}> {}
+}> { }
 
 const notImplemented = <A = never>(feature: string) =>
     Effect.fail(new JobFeatureNotImplementedError({ feature })) as Effect.Effect<
@@ -144,10 +124,10 @@ const staticJobQueue = (job: JobDefinition.Any): QueueName | undefined =>
     typeof job.queue === "string" ? job.queue : undefined;
 
 const insertWithHooks = <const Name extends string, ResultSchema extends Schema.Top>(
-    plugins: ReadonlyArray<EffectJobPlugin>,
     command: JobCommand<Name, unknown, ResultSchema["Type"]>,
 ) =>
     Effect.gen(function* () {
+        const plugins = yield* JobPlugins;
         const handle = yield* insertJobCommand(command);
         const record = yield* Job.find(handle.id);
 
@@ -160,15 +140,15 @@ const insertWithHooks = <const Name extends string, ResultSchema extends Schema.
         return handle;
     });
 
-const makeRuntimeLayer = (config: JobSystemBaseConfig) =>
+const makeRuntimeLayer = (config: JobRuntimeConfig) =>
     Layer.effect(JobRuntime)(
         Effect.succeed({
             insert: (command: JobCommand<any, unknown, any>) =>
-                insertWithHooks(config.plugins ?? [], command),
+                insertWithHooks(command),
             insertMany: (commands: ReadonlyArray<JobCommand<any, unknown, any>>) =>
                 Effect.forEach(
                     commands,
-                    (command) => insertWithHooks(config.plugins ?? [], command),
+                    (command) => insertWithHooks(command),
                     { concurrency: 1 },
                 ),
             resolve: resolveJobCommand,
@@ -176,53 +156,31 @@ const makeRuntimeLayer = (config: JobSystemBaseConfig) =>
     );
 
 const workerOptions = (
-    config: JobSystemBaseConfig,
+    config: JobRuntimeConfig,
     options?: WorkerRunOptions,
 ): WorkerRunOptions => ({
-    queues: options?.queues ?? config.queues,
+    queues: options?.queues ?? config.queues as WorkerRunOptions["queues"],
     pollInterval: options?.pollInterval ?? config.pollInterval,
-    plugins: options?.plugins ?? config.plugins,
-    workerId: options?.workerId ?? config.workerId,
+    workerId: options?.workerId,
     shutdownGracePeriod:
         options?.shutdownGracePeriod ?? config.shutdownGracePeriod,
 });
 
-const makeLayer = (
-    config: JobSystemBaseConfig,
-    database: Layer.Layer<any, any, any>,
-) => {
+const makeLayer = (config: JobRuntimeConfig) => {
     const runtimeLayer = makeRuntimeLayer(config);
-    const extraLayers = [
-        ...(config.layers ?? []),
-        ...(config.plugins ?? []).flatMap((plugin) =>
-            plugin.layer === undefined ? [] : [plugin.layer],
-        ),
-    ];
-    const dependencies = mergeLayers([
+    return mergeLayers([
         JobRegistryMemory,
         runtimeLayer,
-        ...extraLayers,
-    ])!;
-    const inlineHandlers = (config.jobs ?? []).flatMap((job) =>
-        job.run === undefined ? [] : [job.toLayer()],
-    );
-    const handlerLayer = mergeLayers(inlineHandlers);
-    const handlers = handlerLayer?.pipe(Layer.provide(dependencies));
-
-    return mergeLayers([
-        database,
-        dependencies,
-        ...(handlers === undefined ? [] : [handlers]),
     ])!;
 };
 
-const makeQueueInfo = (config: JobSystemBaseConfig): Effect.Effect<QueueInfo, never, JobRegistry> =>
+const makeQueueInfo = (config: JobRuntimeConfig): Effect.Effect<QueueInfo, never, JobRegistry> =>
     Effect.gen(function* () {
         const registry = yield* JobRegistry;
         const registered = yield* registry.list;
         const declared = uniqueSorted([
-            ...Object.keys(config.catalog.queues),
-            ...(config.jobs ?? []).map(staticJobQueue),
+            "default",
+            ...Object.keys(config.queues ?? {}),
             ...registered.map(({ job }) => staticJobQueue(job)),
         ]);
 
@@ -244,14 +202,29 @@ export interface JobTestRuntime {
     ) => Effect.Effect<void, JobFeatureNotImplementedError>;
 }
 
-export interface ConfiguredJobSystem<Catalog extends JobCatalog<any> = JobCatalog<any>> {
-    readonly catalog: Catalog;
-    readonly role: JobSystemRole;
+export interface EffectJobRuntime<Queues extends JobRuntimeQueues = JobRuntimeQueues> {
     readonly toLayer: () => Layer.Layer<any, any, any>;
     readonly layer: Layer.Layer<any, any, any>;
     readonly runtime: ManagedRuntime.ManagedRuntime<any, any>;
     readonly runPromise: <A, E, R>(effect: Effect.Effect<A, E, R>) => Promise<A>;
     readonly dispose: () => Promise<void>;
+    readonly define: <
+        const Name extends string,
+        PayloadSchema extends Schema.Top,
+        ResultSchema extends Schema.Top = typeof Schema.Unknown,
+    >(
+        options: JobDefinitionOptions<
+            Name,
+            PayloadSchema,
+            ResultSchema,
+            JobRuntimeQueueNames<Queues>
+        >,
+    ) => JobDefinition<
+        Name,
+        PayloadSchema,
+        ResultSchema,
+        JobRuntimeQueueNames<Queues>
+    >;
     readonly insert: <const Name extends string, ResultSchema extends Schema.Top>(
         command: JobCommand<Name, unknown, ResultSchema["Type"]>,
     ) => Effect.Effect<JobHandle<Name, ResultSchema>, InsertError, any>;
@@ -261,7 +234,7 @@ export interface ConfiguredJobSystem<Catalog extends JobCatalog<any> = JobCatalo
     readonly resolve: <const Name extends string, ResultSchema extends Schema.Top>(
         command: JobCommand<Name, unknown, ResultSchema["Type"]>,
     ) => Effect.Effect<ResolvedJobCommand<Name, ResultSchema>, InsertError, any>;
-    readonly run: (options?: WorkerRunOptions) => Effect.Effect<never, never, JobRegistry | any>;
+    readonly run: Effect.Effect<never, never, JobRegistry | any>;
     readonly worker: (options?: WorkerRunOptions) => Effect.Effect<never, never, JobRegistry | any>;
     readonly queues: {
         readonly info: Effect.Effect<QueueInfo, never, JobRegistry>;
@@ -319,33 +292,31 @@ export interface ConfiguredJobSystem<Catalog extends JobCatalog<any> = JobCatalo
     ) => Effect.Effect<never, JobSnoozeError>;
 }
 
-const makeConfiguredSystem = <Catalog extends JobCatalog<any>>(
-    config: JobSystemBaseConfig<Catalog>,
-    database: Layer.Layer<any, any, any>,
-): ConfiguredJobSystem<Catalog> => {
-    const layer = makeLayer(config, database);
+export const makeConfiguredSystem = <Queues extends JobRuntimeQueues>(
+    config: JobRuntimeConfig<Queues>,
+): EffectJobRuntime<Queues> => {
+    const layer = makeLayer(config);
     const runtime = ManagedRuntime.make(
         layer as Layer.Layer<any, any, never>,
     ) as ManagedRuntime.ManagedRuntime<any, any>;
 
     return {
-        catalog: config.catalog,
-        role: config.role ?? "all",
         toLayer: () => layer,
         layer,
         runtime,
         runPromise: (effect) =>
             runtime.runPromise(effect as Effect.Effect<any, any, any>),
         dispose: () => runtime.dispose(),
-        insert: (command) => insertWithHooks(config.plugins ?? [], command),
+        define: (options) => makeJobDefinition(options as any) as any,
+        insert: (command) => insertWithHooks(command),
         insertMany: (commands) =>
             Effect.forEach(
                 commands,
-                (command) => insertWithHooks(config.plugins ?? [], command),
+                (command) => insertWithHooks(command),
                 { concurrency: 1 },
             ),
         resolve: resolveJobCommand,
-        run: (options) => Worker.run(workerOptions(config, options)),
+        run: Worker.run(workerOptions(config)),
         worker: (options) => Worker.run(workerOptions(config, options)),
         queues: {
             info: makeQueueInfo(config),
@@ -389,7 +360,7 @@ const makeConfiguredSystem = <Catalog extends JobCatalog<any>>(
                             record.name === job.name &&
                             (expectation?.payload === undefined ||
                                 JSON.stringify(record.payload) ===
-                                    JSON.stringify(expectation.payload)),
+                                JSON.stringify(expectation.payload)),
                     );
 
                     if (found === undefined) {
@@ -404,36 +375,4 @@ const makeConfiguredSystem = <Catalog extends JobCatalog<any>>(
         discard: Job.discard,
         snooze: Job.snooze,
     };
-};
-
-export const JobSystem = {
-    custom: <Catalog extends JobCatalog<any>>(
-        config: JobSystemBaseConfig<Catalog> & {
-            readonly database: Layer.Layer<any, any, any>;
-        },
-    ): ConfiguredJobSystem<Catalog> =>
-        makeConfiguredSystem(config, config.database),
-    memory: <Catalog extends JobCatalog<any>>(
-        config: JobSystemMemoryConfig<Catalog>,
-    ): ConfiguredJobSystem<Catalog> =>
-        makeConfiguredSystem(
-            config,
-            Layer.mergeAll(JobEngineMemory, JobNotifierMemory),
-        ),
-    postgres: <Catalog extends JobCatalog<any>>(
-        config: JobSystemPostgresConfig<Catalog>,
-    ): ConfiguredJobSystem<Catalog> => {
-        const database = postgresDatabase(
-            config.database ?? ({
-                ...(config.url === undefined ? {} : { url: config.url }),
-                ...(config.schema === undefined ? {} : { schema: config.schema }),
-                ...(config.table === undefined ? {} : { table: config.table }),
-            } as any),
-        );
-
-        return makeConfiguredSystem(
-            config,
-            Layer.mergeAll(database, JobNotifierMemory),
-        );
-    },
 };

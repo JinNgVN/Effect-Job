@@ -5,13 +5,18 @@ import {
     DuplicateJobError,
     JobEngine,
     JobStorageError,
+    normalizeJobErrors,
 } from "../engine";
 import type {
     JobError,
     JobListOptions,
+    JobPruneOptions,
     JobRecord,
+    JobRescueOptions,
+    JobRescueResult,
     JobStatus,
     NewJob,
+    WorkerId,
 } from "../model";
 import {
     postgresTable,
@@ -19,12 +24,7 @@ import {
 } from "./postgresSchema";
 
 export interface PostgresOptions
-    extends PostgresSchemaOptions,
-    PgClient.PgPoolConfig { }
-
-export type PostgresDatabaseInput =
-    | PostgresOptions
-    | Layer.Layer<PgClient.PgClient, any, any>;
+    extends PostgresSchemaOptions { }
 
 interface JobRow {
     readonly id: string;
@@ -36,6 +36,8 @@ interface JobRow {
     readonly status: JobStatus;
     readonly priority: number;
     readonly attempt: number;
+    readonly executions: number;
+    readonly snoozes: number;
     readonly max_attempts: number;
     readonly run_at: Date | string;
     readonly idempotency_key: string | null;
@@ -65,16 +67,6 @@ const activeStatuses = [
     "retryable",
 ];
 
-const isPgLayer = (
-    input: PostgresDatabaseInput,
-): input is Layer.Layer<PgClient.PgClient, any, any> =>
-    typeof input === "object" &&
-    input !== null &&
-    "pipe" in input &&
-    !("url" in input) &&
-    !("host" in input) &&
-    !("database" in input);
-
 const asDate = (value: Date | string): Date =>
     value instanceof Date ? value : new Date(value);
 
@@ -99,6 +91,8 @@ export const postgresRowToJobRecord = (row: JobRow): JobRecord => ({
     status: row.status,
     priority: row.priority,
     attempt: row.attempt,
+    executions: row.executions,
+    snoozes: row.snoozes,
     maxAttempts: row.max_attempts,
     runAt: asDate(row.run_at),
     idempotencyKey: row.idempotency_key,
@@ -166,6 +160,8 @@ INSERT INTO ${table} (
   status,
   priority,
   attempt,
+  executions,
+  snoozes,
   max_attempts,
   run_at,
   idempotency_key,
@@ -180,6 +176,8 @@ VALUES (
   $6::text[],
   $7,
   $8,
+  0,
+  0,
   0,
   $9,
   $10,
@@ -228,6 +226,119 @@ ${options?.limit === undefined ? "" : `LIMIT $${params.length}`}
         params,
     };
 };
+
+const claimNextSql = (table: string) => `
+WITH selected AS (
+  SELECT id
+  FROM ${table}
+  WHERE ($1::text IS NULL OR queue = $1)
+    AND status IN ('available', 'scheduled', 'retryable')
+    AND run_at <= now()
+  ORDER BY priority ASC, run_at ASC, inserted_at ASC
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
+UPDATE ${table}
+SET status = 'executing',
+    executions = executions + 1,
+    attempted_at = now(),
+    attempted_by = CASE
+      WHEN $2::text IS NULL THEN attempted_by
+      ELSE array_append(attempted_by, $2::text)
+    END,
+    updated_at = now()
+WHERE id IN (SELECT id FROM selected)
+RETURNING *
+`;
+
+const completeSql = (table: string) => `
+UPDATE ${table}
+SET status = 'completed',
+    completed_at = now(),
+    updated_at = now()
+WHERE id = $1
+`;
+
+const failSql = (table: string) => `
+UPDATE ${table}
+SET status = CASE
+      WHEN $3::boolean OR attempt + 1 >= max_attempts THEN 'discarded'
+      ELSE 'retryable'
+    END,
+    attempt = attempt + 1,
+    run_at = COALESCE($4::timestamptz, run_at),
+    discarded_at = CASE
+      WHEN $3::boolean OR attempt + 1 >= max_attempts THEN now()
+      ELSE NULL
+    END,
+    errors = errors || $2::jsonb,
+    updated_at = now()
+WHERE id = $1
+`;
+
+const cancelSql = (table: string) => `
+UPDATE ${table}
+SET status = 'cancelled',
+    cancelled_at = now(),
+    errors = errors || $2::jsonb,
+    updated_at = now()
+WHERE id = $1
+`;
+
+const snoozeSql = (table: string) => `
+UPDATE ${table}
+SET status = 'scheduled',
+    run_at = $2,
+    snoozes = snoozes + 1,
+    updated_at = now()
+WHERE id = $1
+`;
+
+const runNowSql = (table: string) => `
+UPDATE ${table}
+SET status = 'available',
+    run_at = now(),
+    updated_at = now()
+WHERE id = $1
+  AND status IN ('scheduled', 'retryable')
+`;
+
+const pruneSql = (table: string) => `
+DELETE FROM ${table}
+WHERE status = ANY($1::text[])
+  AND updated_at < $2
+RETURNING id
+`;
+
+const rescueSql = (table: string) => `
+WITH selected AS (
+  SELECT *
+  FROM ${table}
+  WHERE status = 'executing'
+    AND attempted_at < $1
+  FOR UPDATE SKIP LOCKED
+),
+updated AS (
+  UPDATE ${table}
+  SET status = CASE
+        WHEN selected.attempt >= selected.max_attempts THEN 'discarded'
+        ELSE 'available'
+      END,
+      discarded_at = CASE
+        WHEN selected.attempt >= selected.max_attempts THEN now()
+        ELSE ${table}.discarded_at
+      END,
+      run_at = CASE
+        WHEN selected.attempt >= selected.max_attempts THEN ${table}.run_at
+        ELSE now()
+      END,
+      updated_at = now()
+  FROM selected
+  WHERE ${table}.id = selected.id
+  RETURNING ${table}.*
+)
+SELECT * FROM updated
+`;
 
 const makeEngine = (schemaOptions: PostgresSchemaOptions) =>
     Effect.gen(function* () {
@@ -318,26 +429,158 @@ const makeEngine = (schemaOptions: PostgresSchemaOptions) =>
                     ),
                 );
             },
-            claimNext: () => unsupported("claimNext"),
-            complete: () => unsupported("complete"),
-            fail: () => unsupported("fail"),
-            cancel: () => unsupported("cancel"),
-            snooze: () => unsupported("snooze"),
-            runNow: () => unsupported("runNow"),
-            prune: () => unsupported("prune"),
-            rescueExecuting: () => unsupported("rescueExecuting"),
+            claimNext: (options?: {
+                readonly queue?: string;
+                readonly workerId?: WorkerId;
+            }) =>
+                sql
+                    .unsafe<JobRow>(claimNextSql(table), [
+                        options?.queue ?? null,
+                        options?.workerId ?? null,
+                    ])
+                    .pipe(
+                        Effect.map((rows) =>
+                            Option.fromNullishOr(rows[0]).pipe(
+                                Option.map(postgresRowToJobRecord),
+                            ),
+                        ),
+                        Effect.catch((cause: unknown) =>
+                            Effect.fail(storageError("claimNext")(cause)),
+                        ),
+                    ),
+            complete: (id: string) =>
+                sql.unsafe(completeSql(table), [id]).pipe(
+                    Effect.asVoid,
+                    Effect.catch((cause: unknown) =>
+                        Effect.fail(storageError("complete")(cause)),
+                    ),
+                ),
+            fail: (
+                id: string,
+                error: unknown,
+                options?: { readonly runAt?: Date; readonly discard?: boolean },
+            ) =>
+                Effect.gen(function* () {
+                    const current = yield* sql
+                        .unsafe<JobRow>(`SELECT * FROM ${table} WHERE id = $1 LIMIT 1`, [
+                            id,
+                        ])
+                        .pipe(Effect.mapError(storageError("fail")));
+                    const record = current[0];
+
+                    if (record === undefined) {
+                        return;
+                    }
+
+                    const nextAttempt = record.attempt + 1;
+                    const errors = normalizeJobErrors(
+                        error,
+                        nextAttempt,
+                        new Date(),
+                    );
+
+                    yield* sql
+                        .unsafe(failSql(table), [
+                            id,
+                            JSON.stringify(errors),
+                            options?.discard === true,
+                            options?.runAt ?? null,
+                        ])
+                        .pipe(
+                            Effect.asVoid,
+                            Effect.mapError(storageError("fail")),
+                        );
+                }),
+            cancel: (id: string, reason: unknown) =>
+                Effect.gen(function* () {
+                    const current = yield* sql
+                        .unsafe<JobRow>(`SELECT * FROM ${table} WHERE id = $1 LIMIT 1`, [
+                            id,
+                        ])
+                        .pipe(Effect.mapError(storageError("cancel")));
+                    const record = current[0];
+
+                    if (record === undefined) {
+                        return;
+                    }
+
+                    const errors = normalizeJobErrors(
+                        reason,
+                        record.attempt,
+                        new Date(),
+                    );
+
+                    yield* sql
+                        .unsafe(cancelSql(table), [
+                            id,
+                            JSON.stringify(errors),
+                        ])
+                        .pipe(
+                            Effect.asVoid,
+                            Effect.mapError(storageError("cancel")),
+                        );
+                }),
+            snooze: (id: string, runAt: Date) =>
+                sql.unsafe(snoozeSql(table), [id, runAt]).pipe(
+                    Effect.asVoid,
+                    Effect.catch((cause: unknown) =>
+                        Effect.fail(storageError("snooze")(cause)),
+                    ),
+                ),
+            runNow: (id: string) =>
+                sql.unsafe(runNowSql(table), [id]).pipe(
+                    Effect.asVoid,
+                    Effect.catch((cause: unknown) =>
+                        Effect.fail(storageError("runNow")(cause)),
+                    ),
+                ),
+            prune: (options: JobPruneOptions) => {
+                const statuses = options.statuses ?? [
+                    "completed",
+                    "cancelled",
+                    "discarded",
+                ];
+
+                return sql
+                    .unsafe<{ readonly id: string }>(pruneSql(table), [
+                        statuses,
+                        options.before,
+                    ])
+                    .pipe(
+                        Effect.map((rows) => rows.length),
+                        Effect.catch((cause: unknown) =>
+                            Effect.fail(storageError("prune")(cause)),
+                        ),
+                    );
+            },
+            rescueExecuting: (
+                options: JobRescueOptions,
+            ): Effect.Effect<JobRescueResult, JobStorageError> =>
+                sql.unsafe<JobRow>(rescueSql(table), [options.before]).pipe(
+                    Effect.map((rows) => {
+                        const records = rows.map(postgresRowToJobRecord);
+
+                        return {
+                            rescued: records.filter(
+                                (record) => record.status === "available",
+                            ),
+                            discarded: records.filter(
+                                (record) => record.status === "discarded",
+                            ),
+                        };
+                    }),
+                    Effect.catch((cause: unknown) =>
+                        Effect.fail(storageError("rescueExecuting")(cause)),
+                    ),
+                ),
         };
     });
 
-export const postgres = (input: PostgresDatabaseInput = {}) => {
-    const schemaOptions = isPgLayer(input) ? {} : input;
-    const engine = Layer.effect(JobEngine)(makeEngine(schemaOptions));
+export const postgres = (
+    options: PostgresOptions = {},
+): Layer.Layer<JobEngine, never, PgClient.PgClient> =>
+    Layer.effect(JobEngine)(makeEngine(options));
 
-    if (isPgLayer(input)) {
-        return engine.pipe(Layer.provide(input));
-    }
-
-    const { schema: _schema, table: _table, ...pgOptions } = input;
-
-    return engine.pipe(Layer.provide(PgClient.layer(pgOptions)));
+export const JobEnginePostgres = {
+    layer: postgres,
 };

@@ -1,27 +1,19 @@
-// Compatibility alias for the vNext configured runtime. New code should use
-// `JobSystem.memory`, `JobSystem.postgres`, or `JobSystem.custom` directly.
+import {
+    makeConfiguredSystem,
+    type EffectJobRuntime,
+    type JobRuntimeConfig,
+    type JobRuntimeQueues,
+} from "./system";
 
-import type { Layer } from "effect";
+export interface EffectJobConfig<
+    Queues extends JobRuntimeQueues = JobRuntimeQueues,
+> extends JobRuntimeConfig<Queues> {}
 
-import { JobCatalog, type JobCatalog as JobCatalogType } from "./catalog";
-import type { JobDefinition } from "./job";
-import { JobSystem, type ConfiguredJobSystem, type JobSystemBaseConfig } from "./system";
+export type ConfiguredEffectJob<
+    Queues extends JobRuntimeQueues = JobRuntimeQueues,
+> = EffectJobRuntime<Queues>;
 
-export interface EffectJobConfig<Catalog extends JobCatalogType<any> = JobCatalogType<any>>
-    extends Omit<JobSystemBaseConfig<Catalog>, "catalog"> {
-    readonly catalog?: Catalog;
-    readonly database: Layer.Layer<any, any, any>;
-    readonly jobs?: ReadonlyArray<JobDefinition.Any>;
-}
-
-export type ConfiguredEffectJob<Catalog extends JobCatalogType<any> = JobCatalogType<any>> =
-    ConfiguredJobSystem<Catalog>;
-
-export const effectJob = <Catalog extends JobCatalogType<any> = JobCatalogType<any>>(
-    config: EffectJobConfig<Catalog>,
-): ConfiguredEffectJob<Catalog> =>
-    JobSystem.custom({
-        ...config,
-        catalog: config.catalog ?? (JobCatalog.define() as Catalog),
-        database: config.database,
-    });
+export const effectJob = <Queues extends JobRuntimeQueues = JobRuntimeQueues>(
+    config: EffectJobConfig<Queues> = {} as EffectJobConfig<Queues>,
+): ConfiguredEffectJob<Queues> =>
+    makeConfiguredSystem(config);
