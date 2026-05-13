@@ -1,13 +1,13 @@
 import { PgClient } from "@effect/sql-pg";
 import { Effect, Layer, Option, Redacted, Schema } from "effect";
 
-
-import { effectJob } from "./effectJob";
-import { Job, JobCommand } from "./job";
+import { effectJob, JobRuntimeLive } from "./effectJob";
+import { Job } from "./job";
 import { JobNotifierMemory } from "./notifier";
 import { JobPluginsLive } from "./plugin";
 import { pruner, rescuer } from "./plugins";
 import { Queue } from "./queue";
+import { JobRegistryMemory } from "./registry";
 import { memory } from "./databases/memory";
 import { JobEnginePostgres } from "./databases/postgres";
 
@@ -24,9 +24,7 @@ export * from "./plugin";
 export * from "./plugins";
 export * from "./queue";
 export * from "./registry";
-export * from "./system";
 export * from "./worker";
-
 
 // ---------------------------------------------------------------------------
 // Demo walkthrough
@@ -39,7 +37,7 @@ export * from "./worker";
 //   1. Configure one runtime with `effectJob({ ... })`.
 //   2. Define job contracts with `Jobs.define(...)`.
 //   3. Register worker handlers with `Job.toLayer(...)`.
-//   4. Enqueue work with `Job.enqueue(...)` or `Job.command(...).pipe(Jobs.insert)`.
+//   4. Enqueue work with `Job.enqueue(...)` or `Jobs.insert(Job.command(...))`.
 //   5. Run workers with `Jobs.run`.
 //
 // Some config below is aspirational and documented in the spec. The current
@@ -72,10 +70,9 @@ const makeProductionRuntimeExample = (url: string) => {
                 rateLimit: {
                     limit: 100,
                     per: "10 seconds",
-                    key: (context: { readonly job: { readonly name: string } }) => [
-                        "queue",
-                        context.job.name,
-                    ],
+                    key: (context: {
+                        readonly job: { readonly name: string };
+                    }) => ["queue", context.job.name],
                 },
             },
             media: { concurrency: 2, pollInterval: "1 second" },
@@ -127,10 +124,11 @@ if (isMain) {
         // This demo configures queues explicitly. The spec also allows a
         // beginner path where the runtime creates a `default` queue
         // automatically. Advanced users can later opt out with
-        // `defaultQueue: false` when they want every job to choose an explicit
-        // queue.
         queues: {
-            default: { concurrency: 1, pollInterval: "50 millis" },
+            default: {
+                concurrency: 1,
+                pollInterval: "50 millis",
+            },
             mailers: { concurrency: 2, pollInterval: "50 millis" },
             webhooks: { concurrency: 2, pollInterval: "50 millis" },
             media: { concurrency: 1, pollInterval: "100 millis" },
@@ -286,13 +284,19 @@ if (isMain) {
             onJobEnqueued: ({ job }) =>
                 Effect.logInfo(`enqueued ${job.name} (${job.queue})`),
             onJobStarted: ({ job }) =>
-                Effect.logInfo(`started ${job.name} execution ${job.executions}`),
+                Effect.logInfo(
+                    `started ${job.name} execution ${job.executions}`,
+                ),
             onJobCompleted: ({ job }) =>
                 Effect.logInfo(`completed ${job.name}`),
             onJobFailed: ({ job, retryAt }) =>
-                Effect.logInfo(`failed ${job.name}, retrying at ${retryAt.toISOString()}`),
+                Effect.logInfo(
+                    `failed ${job.name}, retrying at ${retryAt.toISOString()}`,
+                ),
             onJobSnoozed: ({ job, runAt }) =>
-                Effect.logInfo(`snoozed ${job.name} until ${runAt.toISOString()}`),
+                Effect.logInfo(
+                    `snoozed ${job.name} until ${runAt.toISOString()}`,
+                ),
         }),
     );
 
@@ -304,17 +308,21 @@ if (isMain) {
         // ceremony on the happy path. Use this path for bulk inserts,
         // transactional enqueueing, custom validation, or shared helpers
         // that add metadata/tags consistently.
-        const email = yield* SendEmail.command({
-            userId: "user_1",
-            email: "person@example.com",
-            subject: "Welcome",
-        }).pipe(
-            JobCommand.withQueue("mailers"),
-            JobCommand.withDelay("10 millis"),
-            JobCommand.withMeta({ source: "src/index.ts demo" }),
-            JobCommand.addTags(["demo", "email"]),
-            JobCommand.withPriority(-5),
-            Jobs.insert,
+        const email = yield* Jobs.insert(
+            SendEmail.command(
+                {
+                    userId: "user_1",
+                    email: "person@example.com",
+                    subject: "Welcome",
+                },
+                {
+                    queue: "mailers",
+                    delay: "10 millis",
+                    meta: { source: "src/index.ts demo" },
+                    tags: ["demo", "email"],
+                    priority: -5,
+                },
+            ),
         );
 
         // Happy path scenario:
@@ -323,28 +331,34 @@ if (isMain) {
         // a typed handle. Per-job options are still available here for the
         // common overrides: delay/runAt, priority, metadata, tags, queue,
         // uniqueness/idempotency keys, and duplicate behavior.
-        const webhook = yield* DeliverWebhook.enqueue({
-            tenantId: "tenant_1",
-            endpointId: "endpoint_1",
-            eventId: "event_1",
-            urgent: true,
-        }, {
-            priority: -1,
-            meta: {
-                requestedBy: "signup-flow",
-                accountTier: "enterprise",
+        const webhook = yield* DeliverWebhook.enqueue(
+            {
+                tenantId: "tenant_1",
+                endpointId: "endpoint_1",
+                eventId: "event_1",
+                urgent: true,
             },
-            tags: ["demo", "webhook", "urgent"],
-            duplicate: "use-existing",
-        });
+            {
+                priority: -1,
+                meta: {
+                    requestedBy: "signup-flow",
+                    accountTier: "enterprise",
+                },
+                tags: ["demo", "webhook", "urgent"],
+                duplicate: "use-existing",
+            },
+        );
 
-        const media = yield* ResizeImage.enqueue({
-            imageId: "image_1",
-            width: 1200,
-            height: 800,
-        }, {
-            tags: ["demo", "media"],
-        });
+        const media = yield* ResizeImage.enqueue(
+            {
+                imageId: "image_1",
+                width: 1200,
+                height: 800,
+            },
+            {
+                tags: ["demo", "media"],
+            },
+        );
 
         // Worker scenario:
         // `Jobs.run` is the long-running worker runtime. In this demo we
@@ -352,7 +366,7 @@ if (isMain) {
         // process would run it forever and provide service layers such as
         // EmailServiceLive or HttpClientLive alongside WorkerLive.
         // Calling `enqueue` makes a process a producer. Calling `Jobs.run`
-        // makes it a worker. We do not need a public `role` switch for that.
+        // makes it a worker.
         yield* Jobs.run.pipe(Effect.timeoutOption("250 millis"));
 
         // Operational visibility scenario:
@@ -387,12 +401,14 @@ if (isMain) {
                 reason: "demo cleanup",
             });
         }
-    })
-    await Jobs.runPromise(
-        program.pipe(Effect.provide(DemoLive)),
+    });
+    await Effect.runPromise(
+        program.pipe(
+            Effect.provide(DemoLive),
+            Effect.provide(JobRuntimeLive(Jobs)),
+            Effect.provide(JobRegistryMemory),
+        ) as Effect.Effect<void, unknown, never>,
     );
-
-    await Jobs.dispose();
 
     // Keep the production config example referenced so TypeScript does not treat
     // it as dead code when this file is used as a teaching artifact.

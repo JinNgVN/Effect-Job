@@ -25,11 +25,11 @@ export class MissingJobHandlerError extends Data.TaggedError(
     "MissingJobHandlerError",
 )<{
     readonly jobName: JobName;
-}> { }
+}> {}
 
 export class JobTimeoutError extends Data.TaggedError("JobTimeoutError")<{
     readonly duration: Duration.Input;
-}> { }
+}> {}
 
 export interface WorkerQueueOptions {
     readonly concurrency?: number;
@@ -37,7 +37,7 @@ export interface WorkerQueueOptions {
 }
 
 export interface WorkerRunOptions {
-    readonly queues?: Readonly<Record<QueueName, WorkerQueueOptions | number>>;
+    readonly queues: Readonly<Record<QueueName, WorkerQueueOptions>>;
     readonly pollInterval?: Duration.Input;
     readonly workerId?: WorkerId;
     readonly shutdownGracePeriod?: Duration.Input;
@@ -50,45 +50,25 @@ interface NormalizedQueue {
 }
 
 const normalizeQueues = (
-    options?: WorkerRunOptions,
+    options: WorkerRunOptions,
 ): ReadonlyArray<NormalizedQueue> => {
-    const defaultPollInterval = options?.pollInterval ?? "1 second";
+    const defaultPollInterval = options.pollInterval ?? "1 second";
 
-    if (options?.queues === undefined) {
-        return [
-            {
-                queue: undefined,
-                concurrency: 1,
-                pollInterval: defaultPollInterval,
-            },
-        ];
-    }
-
-    return Object.entries(options.queues).map(([queue, queueOptions]) => {
-        if (typeof queueOptions === "number") {
-            return {
-                queue,
-                concurrency: queueOptions,
-                pollInterval: defaultPollInterval,
-            };
-        }
-
-        return {
-            queue,
-            concurrency: queueOptions.concurrency ?? 1,
-            pollInterval: queueOptions.pollInterval ?? defaultPollInterval,
-        };
-    });
+    return Object.entries(options.queues).map(([queue, queueOptions]) => ({
+        queue,
+        concurrency: queueOptions.concurrency ?? 1,
+        pollInterval: queueOptions.pollInterval ?? defaultPollInterval,
+    }));
 };
 
 export const Worker = {
     run: (
-        options?: WorkerRunOptions,
+        options: WorkerRunOptions,
     ): Effect.Effect<never, never, JobEngine | JobRegistry> =>
         Effect.scoped(
             Effect.gen(function* () {
                 const engine = yield* JobEngine;
-                const notifier = yield* JobNotifier;
+                const notifier = yield* Effect.serviceOption(JobNotifier);
                 const registry = yield* JobRegistry;
                 const queues = normalizeQueues(options);
                 const plugins = yield* JobPlugins;
@@ -132,16 +112,20 @@ export const Worker = {
 
                                 if (Option.isNone(record)) {
                                     // Notifications wake the worker quickly; polling remains the correctness fallback.
-                                    yield* notifier
-                                        .waitForInsert({ queue: queue.queue })
-                                        .pipe(
-                                            Effect.race(
-                                                Effect.sleep(
-                                                    queue.pollInterval,
-                                                ),
-                                            ),
-                                            Effect.asVoid,
-                                        );
+                                    const waitForInsert = Option.isSome(
+                                        notifier,
+                                    )
+                                        ? notifier.value.waitForInsert({
+                                              queue: queue.queue,
+                                          })
+                                        : Effect.never;
+
+                                    yield* waitForInsert.pipe(
+                                        Effect.race(
+                                            Effect.sleep(queue.pollInterval),
+                                        ),
+                                        Effect.asVoid,
+                                    );
                                     return;
                                 }
 
@@ -176,12 +160,12 @@ export const Worker = {
                                             (plugin) =>
                                                 Option.isSome(failed)
                                                     ? plugin.onJobFailed?.({
-                                                        job: failed.value,
-                                                        error,
-                                                        retryAt:
-                                                            failed.value
-                                                                .runAt,
-                                                    })
+                                                          job: failed.value,
+                                                          error,
+                                                          retryAt:
+                                                              failed.value
+                                                                  .runAt,
+                                                      })
                                                     : undefined,
                                         );
                                         return;
@@ -210,8 +194,7 @@ export const Worker = {
                                             maxAttempts:
                                                 record.value.maxAttempts,
                                             runAt: record.value.runAt,
-                                            insertedAt:
-                                                record.value.insertedAt,
+                                            insertedAt: record.value.insertedAt,
                                             attemptedBy:
                                                 record.value.attemptedBy,
                                         };
@@ -228,14 +211,14 @@ export const Worker = {
                                         timeout === undefined
                                             ? runJob
                                             : Effect.timeoutOrElse(runJob, {
-                                                duration: timeout,
-                                                orElse: () =>
-                                                    Effect.fail(
-                                                        new JobTimeoutError({
-                                                            duration: timeout,
-                                                        }),
-                                                    ),
-                                            });
+                                                  duration: timeout,
+                                                  orElse: () =>
+                                                      Effect.fail(
+                                                          new JobTimeoutError({
+                                                              duration: timeout,
+                                                          }),
+                                                      ),
+                                              });
                                     const exit = yield* jobEffect.pipe(
                                         Effect.exit,
                                     );
@@ -251,8 +234,8 @@ export const Worker = {
                                             (plugin) =>
                                                 Option.isSome(completed)
                                                     ? plugin.onJobCompleted?.({
-                                                        job: completed.value,
-                                                    })
+                                                          job: completed.value,
+                                                      })
                                                     : undefined,
                                         );
                                     } else {
@@ -260,44 +243,48 @@ export const Worker = {
                                             (reason) =>
                                                 Cause.isFailReason(reason) &&
                                                 reason.error instanceof
-                                                JobCancelError,
+                                                    JobCancelError,
                                         );
                                         const snooze = exit.cause.reasons.find(
                                             (reason) =>
                                                 Cause.isFailReason(reason) &&
                                                 reason.error instanceof
-                                                JobSnoozeError,
+                                                    JobSnoozeError,
                                         );
                                         const discard = exit.cause.reasons.find(
                                             (reason) =>
                                                 Cause.isFailReason(reason) &&
                                                 reason.error instanceof
-                                                JobDiscardError,
+                                                    JobDiscardError,
                                         );
 
                                         if (
                                             cancel !== undefined &&
                                             Cause.isFailReason(cancel) &&
-                                            cancel.error instanceof JobCancelError
+                                            cancel.error instanceof
+                                                JobCancelError
                                         ) {
                                             yield* engine.cancel(
                                                 record.value.id,
                                                 cancel.error.reason,
                                             );
-                                            const cancelled = yield* engine.find(
-                                                record.value.id,
-                                            );
+                                            const cancelled =
+                                                yield* engine.find(
+                                                    record.value.id,
+                                                );
 
                                             yield* runPluginHooks(
                                                 plugins,
                                                 (plugin) =>
                                                     Option.isSome(cancelled)
-                                                        ? plugin.onJobCancelled?.({
-                                                            job: cancelled.value,
-                                                            reason:
-                                                                cancel.error
-                                                                    .reason,
-                                                        })
+                                                        ? plugin.onJobCancelled?.(
+                                                              {
+                                                                  job: cancelled.value,
+                                                                  reason: cancel
+                                                                      .error
+                                                                      .reason,
+                                                              },
+                                                          )
                                                         : undefined,
                                             );
                                             return;
@@ -306,13 +293,14 @@ export const Worker = {
                                         if (
                                             snooze !== undefined &&
                                             Cause.isFailReason(snooze) &&
-                                            snooze.error instanceof JobSnoozeError
+                                            snooze.error instanceof
+                                                JobSnoozeError
                                         ) {
                                             const runAt = new Date(
                                                 Date.now() +
-                                                Duration.toMillis(
-                                                    snooze.error.duration,
-                                                ),
+                                                    Duration.toMillis(
+                                                        snooze.error.duration,
+                                                    ),
                                             );
 
                                             yield* engine.snooze(
@@ -327,10 +315,12 @@ export const Worker = {
                                                 plugins,
                                                 (plugin) =>
                                                     Option.isSome(snoozed)
-                                                        ? plugin.onJobSnoozed?.({
-                                                            job: snoozed.value,
-                                                            runAt,
-                                                        })
+                                                        ? plugin.onJobSnoozed?.(
+                                                              {
+                                                                  job: snoozed.value,
+                                                                  runAt,
+                                                              },
+                                                          )
                                                         : undefined,
                                             );
                                             return;
@@ -339,33 +329,38 @@ export const Worker = {
                                         if (
                                             discard !== undefined &&
                                             Cause.isFailReason(discard) &&
-                                            discard.error instanceof JobDiscardError
+                                            discard.error instanceof
+                                                JobDiscardError
                                         ) {
                                             yield* engine.fail(
                                                 record.value.id,
                                                 discard.error.reason,
                                                 { discard: true },
                                             );
-                                            const discarded = yield* engine.find(
-                                                record.value.id,
-                                            );
+                                            const discarded =
+                                                yield* engine.find(
+                                                    record.value.id,
+                                                );
 
                                             yield* runPluginHooks(
                                                 plugins,
                                                 (plugin) =>
                                                     Option.isSome(discarded)
-                                                        ? plugin.onJobDiscarded?.({
-                                                            job: discarded.value,
-                                                            error:
-                                                                discard.error
-                                                                    .reason,
-                                                        })
+                                                        ? plugin.onJobDiscarded?.(
+                                                              {
+                                                                  job: discarded.value,
+                                                                  error: discard
+                                                                      .error
+                                                                      .reason,
+                                                              },
+                                                          )
                                                         : undefined,
                                             );
                                             return;
                                         }
 
-                                        const nextAttempt = record.value.attempt + 1;
+                                        const nextAttempt =
+                                            record.value.attempt + 1;
                                         const backoffValue =
                                             registeredJob.value.job.backoff({
                                                 attempt: nextAttempt,
@@ -374,16 +369,18 @@ export const Worker = {
                                                 error: exit.cause,
                                                 job: record.value,
                                             });
-                                        const backoff =
-                                            Effect.isEffect(backoffValue)
-                                                ? yield* (backoffValue as Effect.Effect<
-                                                      Duration.Input,
-                                                      never,
-                                                      any
-                                                  >)
-                                                : backoffValue;
+                                        const backoff = Effect.isEffect(
+                                            backoffValue,
+                                        )
+                                            ? yield* backoffValue as Effect.Effect<
+                                                  Duration.Input,
+                                                  never,
+                                                  any
+                                              >
+                                            : backoffValue;
                                         const retryAt = new Date(
-                                            Date.now() + Duration.toMillis(backoff),
+                                            Date.now() +
+                                                Duration.toMillis(backoff),
                                         );
 
                                         yield* engine.fail(
@@ -400,21 +397,22 @@ export const Worker = {
                                             (plugin) =>
                                                 Option.isSome(failed)
                                                     ? plugin.onJobFailed?.({
-                                                        job: failed.value,
-                                                        error: exit.cause,
-                                                        retryAt,
-                                                    })
+                                                          job: failed.value,
+                                                          error: exit.cause,
+                                                          retryAt,
+                                                      })
                                                     : undefined,
                                         );
                                         yield* runPluginHooks(
                                             plugins,
                                             (plugin) =>
                                                 Option.isSome(failed) &&
-                                                    failed.value.status === "discarded"
+                                                failed.value.status ===
+                                                    "discarded"
                                                     ? plugin.onJobDiscarded?.({
-                                                        job: failed.value,
-                                                        error: exit.cause,
-                                                    })
+                                                          job: failed.value,
+                                                          error: exit.cause,
+                                                      })
                                                     : undefined,
                                         );
                                         yield* Effect.logError(exit.cause);

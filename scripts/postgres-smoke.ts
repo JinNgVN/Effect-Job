@@ -8,8 +8,9 @@ import {
     JobEngine,
     JobEnginePostgres,
     JobNotifierMemory,
+    JobRegistryMemory,
+    JobRuntimeLive,
 } from "../src/index";
-
 
 const databaseUrl = process.env.DATABASE_URL;
 
@@ -32,15 +33,18 @@ const SmokeJob = Jobs.define({
 });
 
 const Live = Layer.mergeAll(
-
     JobEnginePostgres.layer({
         schema: "public",
         table: "effect_jobs",
     }),
     JobNotifierMemory,
-).pipe(Layer.provideMerge(PgClient.layer({
-    url: Redacted.make(databaseUrl),
-})));
+).pipe(
+    Layer.provideMerge(
+        PgClient.layer({
+            url: Redacted.make(databaseUrl),
+        }),
+    ),
+);
 
 const expectSome = <A>(option: Option.Option<A>, label: string) =>
     Option.match(option, {
@@ -74,7 +78,9 @@ const program = Effect.gen(function* () {
 
     if (completed.status !== "completed") {
         return yield* Effect.fail(
-            new Error(`Expected completed status, received ${completed.status}`),
+            new Error(
+                `Expected completed status, received ${completed.status}`,
+            ),
         );
     }
 
@@ -96,5 +102,10 @@ const program = Effect.gen(function* () {
     });
 });
 
-await Jobs.runPromise(program.pipe(Effect.provide()));
-await Jobs.dispose();
+await Effect.runPromise(
+    program.pipe(
+        Effect.provide(Live),
+        Effect.provide(JobRuntimeLive(Jobs)),
+        Effect.provide(JobRegistryMemory),
+    ) as Effect.Effect<void, unknown, never>,
+);

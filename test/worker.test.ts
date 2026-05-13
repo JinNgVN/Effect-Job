@@ -1,14 +1,28 @@
 import { Deferred, Duration, Effect, Fiber, Layer, Option, Schema } from "effect";
 import { describe, expect, it } from "vitest";
 
-import { effectJob, Job, JobNotifierMemory, memory } from "../src";
+import {
+    effectJob,
+    Job,
+    JobNotifierMemory,
+    JobRegistryMemory,
+    JobRuntimeLive,
+    memory,
+} from "../src";
+
+const runPromise = <A, E>(effect: Effect.Effect<A, E, any>) =>
+    Effect.runPromise(effect as Effect.Effect<A, E, never>);
 
 describe("worker runtime", () => {
     it("claims and completes one available job", async () => {
         const Jobs = effectJob({
+            queues: {
+                work: { concurrency: 1, pollInterval: "10 millis" },
+            },
         });
         const WorkJob = Jobs.define({
             name: "demo.work",
+            queue: "work",
             payload: Schema.Struct({
                 message: Schema.String,
             }),
@@ -21,12 +35,16 @@ describe("worker runtime", () => {
         );
         const Live = Layer.mergeAll(memory(), JobNotifierMemory, WorkJobLive);
 
-        const record = await Jobs.runPromise(
+        const record = await runPromise(
             Effect.gen(function* () {
                 const handle = yield* WorkJob.enqueue({ message: "hello" });
                 yield* Jobs.run.pipe(Effect.timeoutOption("50 millis"));
                 return yield* Job.find(handle.id);
-            }).pipe(Effect.provide(Live)),
+            }).pipe(
+                Effect.provide(Live),
+                Effect.provide(JobRuntimeLive(Jobs)),
+                Effect.provide(JobRegistryMemory),
+            ),
         );
 
         expect(handled).toBe("hello");
@@ -60,7 +78,7 @@ describe("worker runtime", () => {
         const BillingJobLive = BillingJob.toLayer(() => Effect.void);
         const Live = Layer.mergeAll(memory(), JobNotifierMemory, BillingJobLive);
 
-        const records = await Jobs.runPromise(
+        const records = await runPromise(
             Effect.gen(function* () {
                 yield* MailJob.enqueue({ id: "mail" });
                 yield* BillingJob.enqueue({ id: "billing" });
@@ -70,7 +88,11 @@ describe("worker runtime", () => {
                     },
                 }).pipe(Effect.timeoutOption("50 millis"));
                 return yield* Job.list();
-            }).pipe(Effect.provide(Live)),
+            }).pipe(
+                Effect.provide(Live),
+                Effect.provide(JobRuntimeLive(Jobs)),
+                Effect.provide(JobRegistryMemory),
+            ),
         );
 
         expect(records.find((record) => record.name === "demo.mail")?.status).toBe(
@@ -83,9 +105,13 @@ describe("worker runtime", () => {
 
     it("retries and then discards failed jobs after attempts are exhausted", async () => {
         const Jobs = effectJob({
+            queues: {
+                retry: { concurrency: 1, pollInterval: "10 millis" },
+            },
         });
         const RetryJob = Jobs.define({
             name: "demo.retry",
+            queue: "retry",
             payload: Schema.Struct({ message: Schema.String }),
             attempts: {
                 max: 2,
@@ -95,12 +121,16 @@ describe("worker runtime", () => {
         const RetryJobLive = RetryJob.toLayer(() => Effect.fail("boom"));
         const Live = Layer.mergeAll(memory(), JobNotifierMemory, RetryJobLive);
 
-        const record = await Jobs.runPromise(
+        const record = await runPromise(
             Effect.gen(function* () {
                 const handle = yield* RetryJob.enqueue({ message: "hello" });
                 yield* Jobs.run.pipe(Effect.timeoutOption("250 millis"));
                 return yield* Job.find(handle.id);
-            }).pipe(Effect.provide(Live)),
+            }).pipe(
+                Effect.provide(Live),
+                Effect.provide(JobRuntimeLive(Jobs)),
+                Effect.provide(JobRegistryMemory),
+            ),
         );
 
         expect(Option.isSome(record)).toBe(true);
@@ -141,14 +171,18 @@ describe("worker runtime", () => {
         );
         const Live = Layer.mergeAll(memory(), JobNotifierMemory, WorkerLive);
 
-        const records = await Jobs.runPromise(
+        const records = await runPromise(
             Effect.gen(function* () {
                 yield* CancelJob.enqueue({ id: "cancel" });
                 yield* DiscardJob.enqueue({ id: "discard" });
                 yield* SnoozeJob.enqueue({ id: "snooze" });
                 yield* Jobs.run.pipe(Effect.timeoutOption("120 millis"));
                 return yield* Job.list();
-            }).pipe(Effect.provide(Live)),
+            }).pipe(
+                Effect.provide(Live),
+                Effect.provide(JobRuntimeLive(Jobs)),
+                Effect.provide(JobRegistryMemory),
+            ),
         );
 
         expect(records.find((record) => record.name === "demo.cancel")?.status).toBe(
@@ -189,7 +223,7 @@ describe("worker runtime", () => {
         );
         const Live = Layer.mergeAll(memory(), JobNotifierMemory, ShutdownJobLive);
 
-        const record = await Jobs.runPromise(
+        const record = await runPromise(
             Effect.gen(function* () {
                 const handle = yield* ShutdownJob.enqueue({ message: "hello" });
                 const worker = yield* Jobs.run.pipe(
@@ -200,7 +234,11 @@ describe("worker runtime", () => {
                 yield* Fiber.interrupt(worker);
 
                 return yield* Job.find(handle.id);
-            }).pipe(Effect.provide(Live)),
+            }).pipe(
+                Effect.provide(Live),
+                Effect.provide(JobRuntimeLive(Jobs)),
+                Effect.provide(JobRegistryMemory),
+            ),
         );
 
         expect(Option.isSome(record)).toBe(true);

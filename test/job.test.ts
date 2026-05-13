@@ -4,10 +4,15 @@ import { describe, expect, it } from "vitest";
 import { effectJob, JobRegistry, JobRegistryMemory } from "../src";
 
 describe("effectJob define API", () => {
-    it("defines runtime-bound jobs with an implicit default queue", () => {
-        const Jobs = effectJob();
+    it("defines runtime-bound jobs with an explicit queue", () => {
+        const Jobs = effectJob({
+            queues: {
+                mailers: {},
+            },
+        });
         const SendEmail = Jobs.define({
             name: "email.send",
+            queue: "mailers",
             payload: Schema.Struct({
                 email: Schema.String,
             }),
@@ -23,9 +28,14 @@ describe("effectJob define API", () => {
     });
 
     it("registers a handler through job.toLayer", async () => {
-        const Jobs = effectJob();
+        const Jobs = effectJob({
+            queues: {
+                mailers: {},
+            },
+        });
         const SendEmail = Jobs.define({
             name: "email.layer",
+            queue: "mailers",
             payload: Schema.Struct({
                 email: Schema.String,
             }),

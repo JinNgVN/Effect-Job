@@ -28,23 +28,24 @@ import {
     type JobRun,
 } from "./registry";
 
-export type MaybeEffect<A, E = never, R = never> =
-    | A
-    | Effect.Effect<A, E, R>;
+export type MaybeEffect<A, E = never, R = never> = A | Effect.Effect<A, E, R>;
 
 export type Policy<Context, Value, Requirements = never> =
     | Value
     | ((context: Context) => MaybeEffect<Value, never, Requirements>);
 
 export type JobQueuePolicy<Payload, Queues extends string = string> = Policy<
-    JobCommandPolicyContext<Payload>,
+    JobCommandPolicyContext<Payload, Queues>,
     QueueSelection<Queues>,
     any
 >;
 
-export interface JobCommandPolicyContext<Payload = unknown> {
+export interface JobCommandPolicyContext<
+    Payload = unknown,
+    Queues extends string = string,
+> {
     readonly payload: Payload;
-    readonly options: JobCommandOptions;
+    readonly options: JobCommandOptions<Queues>;
 }
 
 export interface JobRunContext<Name extends string = string> {
@@ -78,8 +79,11 @@ export type JobRunHandler<
     input: JobRunInput<Payload, Name>,
 ) => Effect.Effect<Result, Error, Requirements>;
 
-export interface JobAttemptsOptions<Payload = unknown> {
-    readonly max?: Policy<JobCommandPolicyContext<Payload>, number, any>;
+export interface JobAttemptsOptions<
+    Payload = unknown,
+    Queues extends string = string,
+> {
+    readonly max?: Policy<JobCommandPolicyContext<Payload, Queues>, number, any>;
     readonly backoff?: (
         context: JobBackoffContext,
     ) => MaybeEffect<Duration.Input, never, any>;
@@ -89,13 +93,16 @@ export interface JobAttemptsOptions<Payload = unknown> {
     }) => MaybeEffect<"retry" | "discard" | "cancel", never, any>;
 }
 
-export type JobAttempts<Payload = unknown> =
+export type JobAttempts<Payload = unknown, Queues extends string = string> =
     | number
-    | JobAttemptsOptions<Payload>;
+    | JobAttemptsOptions<Payload, Queues>;
 
-export interface UniqueOptions<Payload = unknown> {
+export interface UniqueOptions<
+    Payload = unknown,
+    Queues extends string = string,
+> {
     readonly key: Policy<
-        JobCommandPolicyContext<Payload>,
+        JobCommandPolicyContext<Payload, Queues>,
         string | ReadonlyArray<string | number | boolean>,
         any
     >;
@@ -103,46 +110,59 @@ export interface UniqueOptions<Payload = unknown> {
     readonly for?: Duration.Input | "forever";
 }
 
-export interface ConcurrencyOptions<Payload = unknown> {
+export interface ConcurrencyOptions<
+    Payload = unknown,
+    Queues extends string = string,
+> {
     readonly key?: Policy<
-        JobCommandPolicyContext<Payload>,
+        JobCommandPolicyContext<Payload, Queues>,
         string | ReadonlyArray<string | number | boolean>,
         any
     >;
-    readonly limit: Policy<JobCommandPolicyContext<Payload>, number, any>;
+    readonly limit: Policy<JobCommandPolicyContext<Payload, Queues>, number, any>;
     readonly scope?: "local" | "global";
 }
 
-export interface RateLimitOptions<Payload = unknown> {
+export interface RateLimitOptions<
+    Payload = unknown,
+    Queues extends string = string,
+> {
     readonly key?: Policy<
-        JobCommandPolicyContext<Payload>,
+        JobCommandPolicyContext<Payload, Queues>,
         string | ReadonlyArray<string | number | boolean>,
         any
     >;
-    readonly limit: Policy<JobCommandPolicyContext<Payload>, number, any>;
+    readonly limit: Policy<JobCommandPolicyContext<Payload, Queues>, number, any>;
     readonly per: Duration.Input;
-    readonly weight?: Policy<JobCommandPolicyContext<Payload>, number, any>;
+    readonly weight?: Policy<JobCommandPolicyContext<Payload, Queues>, number, any>;
     readonly scope?: "local" | "global";
 }
 
-export interface DashboardOptions<Payload = unknown> {
-    readonly title?: Policy<JobCommandPolicyContext<Payload>, string, any>;
+export interface DashboardOptions<
+    Payload = unknown,
+    Queues extends string = string,
+> {
+    readonly title?: Policy<JobCommandPolicyContext<Payload, Queues>, string, any>;
     readonly dimensions?: Readonly<
-        Record<string, Policy<JobCommandPolicyContext<Payload>, string, any>>
+        Record<string, Policy<JobCommandPolicyContext<Payload, Queues>, string, any>>
     >;
     readonly publicPayload?: Policy<
-        JobCommandPolicyContext<Payload>,
+        JobCommandPolicyContext<Payload, Queues>,
         Record<string, unknown>,
         any
     >;
 }
 
-export interface JobHooks<Payload = unknown, Result = unknown> {
+export interface JobHooks<
+    Payload = unknown,
+    Result = unknown,
+    Queues extends string = string,
+> {
     readonly beforeEnqueue?: (context: {
         readonly payload: Payload;
-        readonly options: JobCommandOptions;
+        readonly options: JobCommandOptions<Queues>;
     }) => MaybeEffect<
-        { readonly payload: Payload; readonly options: JobCommandOptions },
+        { readonly payload: Payload; readonly options: JobCommandOptions<Queues> },
         unknown,
         any
     >;
@@ -166,16 +186,16 @@ export interface JobDefinitionOptions<
     Queues extends string = string,
 > {
     readonly name: Name;
-    readonly queue?: JobQueuePolicy<PayloadSchema["Type"], Queues>;
+    readonly queue: JobQueuePolicy<PayloadSchema["Type"], Queues>;
     readonly payload: PayloadSchema;
     readonly result?: ResultSchema;
-    readonly attempts?: JobAttempts<PayloadSchema["Type"]>;
+    readonly attempts?: JobAttempts<PayloadSchema["Type"], Queues>;
     readonly timeout?: Duration.Input;
-    readonly unique?: UniqueOptions<PayloadSchema["Type"]>;
-    readonly concurrency?: ConcurrencyOptions<PayloadSchema["Type"]>;
-    readonly rateLimit?: RateLimitOptions<PayloadSchema["Type"]>;
-    readonly dashboard?: DashboardOptions<PayloadSchema["Type"]>;
-    readonly hooks?: JobHooks<PayloadSchema["Type"], ResultSchema["Type"]>;
+    readonly unique?: UniqueOptions<PayloadSchema["Type"], Queues>;
+    readonly concurrency?: ConcurrencyOptions<PayloadSchema["Type"], Queues>;
+    readonly rateLimit?: RateLimitOptions<PayloadSchema["Type"], Queues>;
+    readonly dashboard?: DashboardOptions<PayloadSchema["Type"], Queues>;
+    readonly hooks?: JobHooks<PayloadSchema["Type"], ResultSchema["Type"], Queues>;
 }
 
 export interface JobDefinition<
@@ -191,24 +211,24 @@ export interface JobDefinition<
     readonly payloadSchema: PayloadSchema;
     readonly result: ResultSchema;
     readonly resultSchema: ResultSchema;
-    readonly attempts: JobAttempts<PayloadSchema["Type"]>;
+    readonly attempts: JobAttempts<PayloadSchema["Type"], Queues>;
     readonly defaultMaxAttempts: number;
     readonly backoff: (
         context: JobBackoffContext,
     ) => MaybeEffect<Duration.Input, never, any>;
     readonly timeout?: Duration.Input;
-    readonly unique?: UniqueOptions<PayloadSchema["Type"]>;
-    readonly concurrency?: ConcurrencyOptions<PayloadSchema["Type"]>;
-    readonly rateLimit?: RateLimitOptions<PayloadSchema["Type"]>;
-    readonly dashboard?: DashboardOptions<PayloadSchema["Type"]>;
-    readonly hooks?: JobHooks<PayloadSchema["Type"], ResultSchema["Type"]>;
+    readonly unique?: UniqueOptions<PayloadSchema["Type"], Queues>;
+    readonly concurrency?: ConcurrencyOptions<PayloadSchema["Type"], Queues>;
+    readonly rateLimit?: RateLimitOptions<PayloadSchema["Type"], Queues>;
+    readonly dashboard?: DashboardOptions<PayloadSchema["Type"], Queues>;
+    readonly hooks?: JobHooks<PayloadSchema["Type"], ResultSchema["Type"], Queues>;
     readonly command: (
         payload: PayloadSchema["Type"],
-        options?: JobCommandOptions,
-    ) => JobCommand<Name, PayloadSchema["Type"], ResultSchema["Type"]>;
+        options?: JobCommandOptions<Queues>,
+    ) => JobCommand<Name, PayloadSchema["Type"], ResultSchema["Type"], Queues>;
     readonly enqueue: (
         payload: PayloadSchema["Type"],
-        options?: JobCommandOptions,
+        options?: JobCommandOptions<Queues>,
     ) => Effect.Effect<
         JobHandle<Name, ResultSchema>,
         InsertError,
@@ -216,7 +236,7 @@ export interface JobDefinition<
     >;
     readonly enqueueMany: (
         payloads: ReadonlyArray<PayloadSchema["Type"]>,
-        options?: JobEnqueueManyOptions,
+        options?: JobEnqueueManyOptions<Queues>,
     ) => Effect.Effect<
         ReadonlyArray<JobHandle<Name, ResultSchema>>,
         InsertError,
@@ -224,7 +244,7 @@ export interface JobDefinition<
     >;
     readonly enqueueStream: (
         payloads: Iterable<PayloadSchema["Type"]>,
-        options?: JobEnqueueManyOptions,
+        options?: JobEnqueueManyOptions<Queues>,
     ) => Effect.Effect<
         ReadonlyArray<JobHandle<Name, ResultSchema>>,
         InsertError,
@@ -249,18 +269,19 @@ export namespace JobDefinition {
     export type Any = JobDefinition<any, any, any, any>;
 }
 
-export interface JobCommandOptions {
+export interface JobCommandOptions<Queues extends string = string> {
     readonly delay?: Duration.Input;
     readonly runAt?: Date;
     readonly priority?: number;
     readonly meta?: Record<string, unknown>;
     readonly tags?: ReadonlyArray<string>;
-    readonly queue?: QueueSelection;
+    readonly queue?: QueueSelection<Queues>;
     readonly idempotencyKey?: string;
     readonly duplicate?: DuplicatePolicy;
 }
 
-export interface JobEnqueueManyOptions extends JobCommandOptions {
+export interface JobEnqueueManyOptions<Queues extends string = string>
+    extends JobCommandOptions<Queues> {
     readonly chunkSize?: number;
     readonly concurrency?: number;
     readonly onInvalidPayload?: "fail" | "collect-errors";
@@ -275,16 +296,16 @@ export interface JobCommand<
     Name extends string = string,
     Payload = unknown,
     Result = unknown,
+    Queues extends string = string,
 > {
     readonly _tag: "JobCommand";
-    readonly job: JobDefinition<Name, any, any, string>;
+    readonly job: JobDefinition<Name, any, any, Queues>;
     readonly name: Name;
     readonly payload: Payload;
-    readonly options: JobCommandOptions;
-    readonly changes: JobCommandOptions;
+    readonly options: JobCommandOptions<Queues>;
+    readonly changes: JobCommandOptions<Queues>;
     readonly errors: ReadonlyArray<JobCommandIssue>;
     readonly valid: boolean;
-    readonly pipe: (...fns: ReadonlyArray<(self: any) => any>) => any;
     readonly _Result?: Result;
 }
 
@@ -292,8 +313,8 @@ export interface ResolvedJobCommand<
     Name extends string = string,
     ResultSchema extends Schema.Top = Schema.Top,
 > {
-    readonly command: JobCommand<Name, unknown, ResultSchema["Type"]>;
-    readonly job: JobDefinition<Name, Schema.Top, ResultSchema, string>;
+    readonly command: JobCommand<Name, unknown, ResultSchema["Type"], any>;
+    readonly job: JobDefinition<Name, Schema.Top, ResultSchema, any>;
     readonly newJob: NewJob;
 }
 
@@ -340,13 +361,15 @@ export class JobRuntime extends Context.Service<
             const Name extends string,
             ResultSchema extends Schema.Top,
         >(
-            command: JobCommand<Name, unknown, ResultSchema["Type"]>,
+            command: JobCommand<Name, unknown, ResultSchema["Type"], any>,
         ) => Effect.Effect<JobHandle<Name, ResultSchema>, InsertError, any>;
         readonly insertMany: <
             const Name extends string,
             ResultSchema extends Schema.Top,
         >(
-            commands: ReadonlyArray<JobCommand<Name, unknown, ResultSchema["Type"]>>,
+            commands: ReadonlyArray<
+                JobCommand<Name, unknown, ResultSchema["Type"], any>
+            >,
         ) => Effect.Effect<
             ReadonlyArray<JobHandle<Name, ResultSchema>>,
             InsertError,
@@ -356,18 +379,25 @@ export class JobRuntime extends Context.Service<
             const Name extends string,
             ResultSchema extends Schema.Top,
         >(
-            command: JobCommand<Name, unknown, ResultSchema["Type"]>,
-        ) => Effect.Effect<ResolvedJobCommand<Name, ResultSchema>, InsertError, any>;
+            command: JobCommand<Name, unknown, ResultSchema["Type"], any>,
+        ) => Effect.Effect<
+            ResolvedJobCommand<Name, ResultSchema>,
+            InsertError,
+            any
+        >;
     }
 >()("effect-job/JobRuntime") {}
 
-export const defaultBackoff = ({ attempt }: JobBackoffContext): Duration.Input =>
+export const defaultBackoff = ({
+    attempt,
+}: JobBackoffContext): Duration.Input =>
     Duration.seconds(
         Math.trunc(Math.pow(attempt, 4) + 15 + Math.random() * 30 * attempt),
     );
 
-const isEffectLike = <A>(value: unknown): value is Effect.Effect<A, never, any> =>
-    Effect.isEffect(value);
+const isEffectLike = <A>(
+    value: unknown,
+): value is Effect.Effect<A, never, any> => Effect.isEffect(value);
 
 export const resolvePolicy = <Context, Value>(
     policy: Policy<Context, Value, any>,
@@ -402,7 +432,9 @@ const normalizeKey = (
 const queueName = (queue: QueueSelection): QueueName =>
     Queue.isDynamic(queue) ? queue.name : queue;
 
-const maxAttemptsFrom = <Payload>(attempts: JobAttempts<Payload>): number => {
+const maxAttemptsFrom = <Payload, Queues extends string>(
+    attempts: JobAttempts<Payload, Queues>,
+): number => {
     if (typeof attempts === "number") {
         return attempts;
     }
@@ -414,28 +446,24 @@ const maxAttemptsFrom = <Payload>(attempts: JobAttempts<Payload>): number => {
     return 20;
 };
 
-const backoffFrom = <Payload>(
-    attempts: JobAttempts<Payload>,
+const backoffFrom = <Payload, Queues extends string>(
+    attempts: JobAttempts<Payload, Queues>,
 ): ((context: JobBackoffContext) => MaybeEffect<Duration.Input, never, any>) =>
     typeof attempts === "number" || attempts.backoff === undefined
         ? defaultBackoff
         : attempts.backoff;
 
-const commandWith = <Command extends JobCommand>(
-    command: Command,
-    options: JobCommandOptions,
-): Command => makeCommand(command.job, command.payload, options, command.errors) as Command;
-
 const makeCommand = <
     const Name extends string,
     Payload,
     Result,
+    Queues extends string,
 >(
-    job: JobDefinition<Name, any, any, string>,
+    job: JobDefinition<Name, any, any, Queues>,
     payload: Payload,
-    options: JobCommandOptions = {},
+    options: JobCommandOptions<Queues> = {},
     errors: ReadonlyArray<JobCommandIssue> = [],
-): JobCommand<Name, Payload, Result> => {
+): JobCommand<Name, Payload, Result, Queues> => {
     const command = {
         _tag: "JobCommand" as const,
         job,
@@ -445,19 +473,14 @@ const makeCommand = <
         changes: options,
         errors,
         valid: errors.length === 0,
-        pipe: (...fns: ReadonlyArray<(self: any) => any>) =>
-            fns.reduce((self, fn) => fn(self), command),
         _Result: undefined as Result | undefined,
     };
 
     return command;
 };
 
-const toHandle = <
-    const Name extends string,
-    ResultSchema extends Schema.Top,
->(
-    job: JobDefinition<Name, Schema.Top, ResultSchema, string>,
+const toHandle = <const Name extends string, ResultSchema extends Schema.Top>(
+    job: JobDefinition<Name, Schema.Top, ResultSchema, any>,
     record: JobRecord,
 ): JobHandle<Name, ResultSchema> => ({
     id: record.id,
@@ -470,12 +493,12 @@ export const resolveJobCommand = <
     const Name extends string,
     ResultSchema extends Schema.Top,
 >(
-    command: JobCommand<Name, unknown, ResultSchema["Type"]>,
+    command: JobCommand<Name, unknown, ResultSchema["Type"], any>,
 ): Effect.Effect<ResolvedJobCommand<Name, ResultSchema>, InsertError, any> =>
     Effect.gen(function* () {
         if (!command.valid) {
             return yield* new JobCommandInvalidError({
-                command: command as JobCommand<any, any, any>,
+                command: command as JobCommand<any, any, any, any>,
                 errors: command.errors,
             });
         }
@@ -486,7 +509,7 @@ export const resolveJobCommand = <
             ResultSchema,
             string
         >;
-        const context: JobCommandPolicyContext = {
+        const context: JobCommandPolicyContext<unknown, string> = {
             payload: command.payload,
             options: command.options,
         };
@@ -520,7 +543,9 @@ export const resolveJobCommand = <
                 maxAttempts,
                 runAt: computeRunAt(command.options),
                 priority: command.options.priority ?? 0,
-                ...(uniqueKey === undefined ? {} : { idempotencyKey: uniqueKey }),
+                ...(uniqueKey === undefined
+                    ? {}
+                    : { idempotencyKey: uniqueKey }),
                 duplicatePolicy: command.options.duplicate ?? "use-existing",
             },
         };
@@ -530,19 +555,17 @@ export const insertJobCommand = <
     const Name extends string,
     ResultSchema extends Schema.Top,
 >(
-    command: JobCommand<Name, unknown, ResultSchema["Type"]>,
-): Effect.Effect<
-    JobHandle<Name, ResultSchema>,
-    InsertError,
-    any
-> =>
+    command: JobCommand<Name, unknown, ResultSchema["Type"], any>,
+): Effect.Effect<JobHandle<Name, ResultSchema>, InsertError, any> =>
     Effect.gen(function* () {
         const resolved = yield* resolveJobCommand(command);
         const engine = yield* JobEngine;
-        const notifier = yield* JobNotifier;
         const record = yield* engine.enqueue(resolved.newJob);
+        const notifier = yield* Effect.serviceOption(JobNotifier);
 
-        yield* notifier.notifyInsert({ queue: record.queue });
+        if (Option.isSome(notifier)) {
+            yield* notifier.value.notifyInsert({ queue: record.queue });
+        }
 
         return toHandle(resolved.job, record);
     });
@@ -551,7 +574,7 @@ export const insertJobCommands = <
     const Name extends string,
     ResultSchema extends Schema.Top,
 >(
-    commands: ReadonlyArray<JobCommand<Name, unknown, ResultSchema["Type"]>>,
+    commands: ReadonlyArray<JobCommand<Name, unknown, ResultSchema["Type"], any>>,
 ): Effect.Effect<
     ReadonlyArray<JobHandle<Name, ResultSchema>>,
     InsertError,
@@ -574,7 +597,7 @@ export const makeJobDefinition = <
     const job = {
         _tag: "JobDefinition" as const,
         name: options.name,
-        queue: options.queue ?? ("default" as QueueSelection<Queues>),
+        queue: options.queue,
         payload: options.payload,
         payloadSchema: options.payload,
         result,
@@ -594,30 +617,40 @@ export const makeJobDefinition = <
             ? {}
             : { dashboard: options.dashboard }),
         ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
-        command: (payload: PayloadSchema["Type"], commandOptions?: JobCommandOptions) =>
-            makeCommand<Name, PayloadSchema["Type"], ResultSchema["Type"]>(
-                job as JobDefinition<Name, any, any, string>,
+        command: (
+            payload: PayloadSchema["Type"],
+            commandOptions?: JobCommandOptions<Queues>,
+        ) =>
+            makeCommand<Name, PayloadSchema["Type"], ResultSchema["Type"], Queues>(
+                job as JobDefinition<Name, any, any, Queues>,
                 payload,
                 commandOptions,
             ),
-        enqueue: (payload: PayloadSchema["Type"], commandOptions?: JobCommandOptions) =>
+        enqueue: (
+            payload: PayloadSchema["Type"],
+            commandOptions?: JobCommandOptions<Queues>,
+        ) =>
             Effect.gen(function* () {
                 const runtime = yield* JobRuntime;
-                return yield* runtime.insert(job.command(payload, commandOptions));
+                return yield* runtime.insert(
+                    job.command(payload, commandOptions),
+                );
             }),
         enqueueMany: (
             payloads: ReadonlyArray<PayloadSchema["Type"]>,
-            commandOptions?: JobEnqueueManyOptions,
+            commandOptions?: JobEnqueueManyOptions<Queues>,
         ) =>
             Effect.gen(function* () {
                 const runtime = yield* JobRuntime;
                 return yield* runtime.insertMany(
-                    payloads.map((payload) => job.command(payload, commandOptions)),
+                    payloads.map((payload) =>
+                        job.command(payload, commandOptions),
+                    ),
                 );
             }),
         enqueueStream: (
             payloads: Iterable<PayloadSchema["Type"]>,
-            commandOptions?: JobEnqueueManyOptions,
+            commandOptions?: JobEnqueueManyOptions<Queues>,
         ) =>
             Effect.gen(function* () {
                 const runtime = yield* JobRuntime;
@@ -649,75 +682,7 @@ export const makeJobDefinition = <
             ),
     };
 
-    return job as JobDefinition<Name, PayloadSchema, ResultSchema, Queues>;
-};
-
-export const JobCommand = {
-    withMeta:
-        (meta: Record<string, unknown>) =>
-        <Command extends JobCommand>(command: Command): Command =>
-            commandWith(command, {
-                ...command.options,
-                meta: { ...(command.options.meta ?? {}), ...meta },
-            }),
-    withTags:
-        (tags: ReadonlyArray<string>) =>
-        <Command extends JobCommand>(command: Command): Command =>
-            commandWith(command, {
-                ...command.options,
-                tags,
-            }),
-    addTags:
-        (tags: ReadonlyArray<string>) =>
-        <Command extends JobCommand>(command: Command): Command =>
-            commandWith(command, {
-                ...command.options,
-                tags: [...(command.options.tags ?? []), ...tags],
-            }),
-    withPriority:
-        (priority: number) =>
-        <Command extends JobCommand>(command: Command): Command =>
-            commandWith(command, {
-                ...command.options,
-                priority,
-            }),
-    withDelay:
-        (delay: Duration.Input) =>
-        <Command extends JobCommand>(command: Command): Command =>
-            commandWith(command, {
-                ...command.options,
-                delay,
-                runAt: undefined,
-            }),
-    withRunAt:
-        (runAt: Date) =>
-        <Command extends JobCommand>(command: Command): Command =>
-            commandWith(command, {
-                ...command.options,
-                runAt,
-                delay: undefined,
-            }),
-    withQueue:
-        (queue: QueueSelection) =>
-        <Command extends JobCommand>(command: Command): Command =>
-            commandWith(command, {
-                ...command.options,
-                queue,
-            }),
-    withIdempotencyKey:
-        (idempotencyKey: string) =>
-        <Command extends JobCommand>(command: Command): Command =>
-            commandWith(command, {
-                ...command.options,
-                idempotencyKey,
-            }),
-    fail:
-        (message: string, path: ReadonlyArray<string> = []) =>
-        <Command extends JobCommand>(command: Command): Command =>
-            makeCommand(command.job, command.payload, command.options, [
-                ...command.errors,
-                { path, message },
-            ]) as Command,
+    return job;
 };
 
 export const Job = {

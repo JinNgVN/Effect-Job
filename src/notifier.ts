@@ -17,15 +17,9 @@ export interface JobNotifierShape {
     }) => Effect.Effect<void>;
 }
 
-export const JobNotifier = Context.Reference<JobNotifierShape>(
+export class JobNotifier extends Context.Service<JobNotifier, JobNotifierShape>()(
     "effect-job/JobNotifier",
-    {
-        defaultValue: () => ({
-            notifyInsert: () => Effect.void,
-            waitForInsert: () => Effect.never,
-        }),
-    },
-);
+) {}
 
 const waitsForQueue = (
     notification: JobInsertNotification,

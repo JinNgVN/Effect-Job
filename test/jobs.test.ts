@@ -1,7 +1,18 @@
 import { Effect, Option, Schema } from "effect";
 import { describe, expect, it } from "vitest";
 
-import { effectJob, Job, JobCommand, JobEngine, memory, Queue } from "../src";
+import {
+    effectJob,
+    Job,
+    JobEngine,
+    JobRegistryMemory,
+    JobRuntimeLive,
+    memory,
+    Queue,
+} from "../src";
+
+const runPromise = <A, E>(effect: Effect.Effect<A, E, any>) =>
+    Effect.runPromise(effect as Effect.Effect<A, E, never>);
 
 describe("Configured job insert API", () => {
     it("stores a job through the explicit command path", async () => {
@@ -18,7 +29,7 @@ describe("Configured job insert API", () => {
             }),
             attempts: 5,
         });
-        const result = await Jobs.runPromise(
+        const result = await runPromise(
             Effect.gen(function* () {
                 const handle = yield* Jobs.insert(
                     SendEmail.command(
@@ -32,7 +43,11 @@ describe("Configured job insert API", () => {
                 const record = yield* Job.find(handle.id);
 
                 return { handle, record };
-            }).pipe(Effect.provide(memory())),
+            }).pipe(
+                Effect.provide(memory()),
+                Effect.provide(JobRuntimeLive(Jobs)),
+                Effect.provide(JobRegistryMemory),
+            ),
         );
 
         expect(result.handle.name).toBe("email.insert");
@@ -50,25 +65,38 @@ describe("Configured job insert API", () => {
         }
     });
 
-    it("supports pipeable command transformations", async () => {
-        const Jobs = effectJob();
+    it("supports command options before insert", async () => {
+        const Jobs = effectJob({
+            queues: {
+                default: {},
+            },
+        });
         const SyncAccount = Jobs.define({
             name: "account.sync",
+            queue: "default",
             payload: Schema.Struct({
                 accountId: Schema.String,
             }),
         });
-        const record = await Jobs.runPromise(
+        const record = await runPromise(
             Effect.gen(function* () {
-                const handle = yield* SyncAccount.command({ accountId: "acct_1" }).pipe(
-                    JobCommand.withMeta({ source: "admin-panel" }),
-                    JobCommand.withPriority(-5),
-                    JobCommand.addTags(["manual"]),
-                    Jobs.insert,
+                const handle = yield* Jobs.insert(
+                    SyncAccount.command(
+                        { accountId: "acct_1" },
+                        {
+                            meta: { source: "admin-panel" },
+                            priority: -5,
+                            tags: ["manual"],
+                        },
+                    ),
                 );
 
                 return yield* Job.find(handle.id);
-            }).pipe(Effect.provide(memory())),
+            }).pipe(
+                Effect.provide(memory()),
+                Effect.provide(JobRuntimeLive(Jobs)),
+                Effect.provide(JobRegistryMemory),
+            ),
         );
 
         expect(Option.isSome(record)).toBe(true);
@@ -81,9 +109,14 @@ describe("Configured job insert API", () => {
     });
 
     it("uses unique keys to return an existing active job", async () => {
-        const Jobs = effectJob();
+        const Jobs = effectJob({
+            queues: {
+                mailers: {},
+            },
+        });
         const SendEmail = Jobs.define({
             name: "email.unique",
+            queue: "mailers",
             payload: Schema.Struct({
                 email: Schema.String,
             }),
@@ -91,7 +124,7 @@ describe("Configured job insert API", () => {
                 key: ({ payload }) => ["email", payload.email],
             },
         });
-        const result = await Jobs.runPromise(
+        const result = await runPromise(
             Effect.gen(function* () {
                 const first = yield* SendEmail.enqueue({
                     email: "same@example.com",
@@ -103,7 +136,11 @@ describe("Configured job insert API", () => {
                 const records = yield* engine.list();
 
                 return { first, second, records };
-            }).pipe(Effect.provide(memory())),
+            }).pipe(
+                Effect.provide(memory()),
+                Effect.provide(JobRuntimeLive(Jobs)),
+                Effect.provide(JobRegistryMemory),
+            ),
         );
 
         expect(result.first.id).toBe(result.second.id);
@@ -114,7 +151,11 @@ describe("Configured job insert API", () => {
     });
 
     it("resolves dynamic queues explicitly", async () => {
-        const Jobs = effectJob();
+        const Jobs = effectJob({
+            queues: {
+                tenants: {},
+            },
+        });
         const TenantJob = Jobs.define({
             name: "tenant.work",
             queue: ({ payload }) => Queue.dynamic(`tenant:${payload.tenantId}`),
@@ -122,11 +163,15 @@ describe("Configured job insert API", () => {
                 tenantId: Schema.String,
             }),
         });
-        const record = await Jobs.runPromise(
+        const record = await runPromise(
             Effect.gen(function* () {
                 const handle = yield* TenantJob.enqueue({ tenantId: "tenant_1" });
                 return yield* Job.find(handle.id);
-            }).pipe(Effect.provide(memory())),
+            }).pipe(
+                Effect.provide(memory()),
+                Effect.provide(JobRuntimeLive(Jobs)),
+                Effect.provide(JobRegistryMemory),
+            ),
         );
 
         expect(Option.isSome(record)).toBe(true);

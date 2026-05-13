@@ -81,9 +81,8 @@ export const JobPlugins = Context.Reference<ReadonlyArray<EffectJobPlugin>>(
     },
 );
 
-export const JobPluginsLive = (
-    ...plugins: ReadonlyArray<EffectJobPlugin>
-) => Layer.succeed(JobPlugins, plugins);
+export const JobPluginsLive = (...plugins: ReadonlyArray<EffectJobPlugin>) =>
+    Layer.succeed(JobPlugins, plugins);
 
 export const runPluginHook = (
     plugin: EffectJobPlugin,
@@ -91,6 +90,8 @@ export const runPluginHook = (
 ) =>
     hook === undefined
         ? Effect.void
+        // Plugin hooks observe lifecycle events. A failing plugin should be
+        // logged, not fail the job or worker lifecycle that emitted the event.
         : hook.pipe(
               Effect.catchCause((cause) =>
                   Effect.logError(`Plugin ${plugin.name} hook failed`, cause),
@@ -103,7 +104,11 @@ export const runPluginHooks = (
         plugin: EffectJobPlugin,
     ) => Effect.Effect<void, unknown, any> | undefined,
 ) =>
-    Effect.forEach(plugins, (plugin) => runPluginHook(plugin, hook(plugin)), {
-        concurrency: "unbounded",
-        discard: true,
-    });
+    Effect.forEach(
+        plugins,
+        (plugin) => runPluginHook(plugin, hook(plugin)),
+        {
+            concurrency: "unbounded",
+            discard: true,
+        },
+    );
